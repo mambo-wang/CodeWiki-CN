@@ -2,8 +2,9 @@
 
 This is the entry-point tool for the IDE-driven wiki generation pipeline.
 It runs CodeWiki's Tree-sitter-based dependency analyzer (no LLM needed),
-caches the results in a new session, and returns a component index the IDE
-agent can use for clustering and documentation.
+caches the results in a new session, and writes the full component index,
+leaf nodes, and other analysis data to files on disk.  The IDE agent reads
+those files directly instead of receiving large payloads over stdio.
 """
 
 from __future__ import annotations
@@ -16,25 +17,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from codewiki.mcp.session import SessionState, SessionStore
+from codewiki.mcp.workspace import SessionWorkspace
 
 logger = logging.getLogger(__name__)
-
-
-def _build_component_index(components: Dict[str, Any], max_items: int = 500) -> Tuple[list, bool]:
-    """Build a lightweight component index for the MCP response.
-
-    Returns (index_list, truncated) where *truncated* is True when the
-    index was capped at *max_items*.
-    """
-    index: list[dict] = []
-    for comp_id, node in list(components.items())[:max_items]:
-        index.append({
-            "id": comp_id,
-            "type": getattr(node, "component_type", "unknown"),
-            "file": getattr(node, "relative_path", ""),
-            "depends_on": list(getattr(node, "depends_on", []))[:20],
-        })
-    return index, len(components) > max_items
 
 
 # ---------------------------------------------------------------------------
@@ -62,9 +47,9 @@ def _detect_changes(
         return None
 
     try:
-        metadata = json.loads(metadata_path.read_text())
-        module_tree = json.loads(module_tree_path.read_text())
-    except (json.JSONDecodeError, OSError):
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        module_tree = json.loads(module_tree_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         return None
 
     # Try git-based detection first
@@ -92,7 +77,7 @@ def _detect_changes(
         "has_previous": True,
         "no_changes": False,
         "method": changes.get("method", "unknown"),
-        "changed_files": changed_files[:50],
+        "changed_files": changed_files,
         "affected_modules": sorted(affected),
         "cascade_modules": sorted(cascade),
         "hint": (
@@ -242,7 +227,8 @@ def handle_analyze_repo(
     arguments: Dict[str, Any],
     store: SessionStore,
 ) -> str:
-    """Run the dependency analysis and return the session + component index."""
+    """Run the dependency analysis, write results to workspace files,
+    and return a compact summary with file paths."""
     repo_path = Path(arguments["repo_path"]).expanduser().resolve()
     if not repo_path.exists():
         return json.dumps({"error": f"Repository not found: {repo_path}"})
@@ -279,6 +265,7 @@ def handle_analyze_repo(
     builder = DependencyGraphBuilder(config)
     components, leaf_nodes = builder.build_dependency_graph()
 
+    # Create the session (generates session_id)
     session = store.create(
         repo_path=str(repo_path),
         output_dir=str(output_dir),
@@ -286,30 +273,70 @@ def handle_analyze_repo(
         leaf_nodes=leaf_nodes,
     )
 
-    index, truncated = _build_component_index(components)
+    # Create the workspace with the real session_id
+    workspace = SessionWorkspace(repo_path, session.session_id)
+    session.workspace = workspace
 
-    # Language stats
+    # -- Write full data to workspace files --
+
+    # 1. Full component index (no pagination)
+    component_index: list[dict] = []
+    for comp_id, node in components.items():
+        component_index.append({
+            "id": comp_id,
+            "type": getattr(node, "component_type", "unknown"),
+            "file": getattr(node, "relative_path", ""),
+        })
+    workspace.write_json("component_index.json", component_index)
+
+    # 2. Full leaf nodes list
+    workspace.write_json("leaf_nodes.json", leaf_nodes)
+
+    # 3. Language stats
     languages: Dict[str, int] = {}
     for node in components.values():
         lang = getattr(node, "language", "unknown")
         languages[lang] = languages.get(lang, 0) + 1
+    workspace.write_json("languages.json", languages)
 
-    # Incremental update: detect changes since last generation
+    # 4. Incremental update: detect changes since last generation
     changes = _detect_changes(repo_path, output_dir)
+    if changes is not None:
+        workspace.write_json("changes.json", changes)
 
-    result = {
+    # 5. Summary with preview for quick reference
+    summary = {
         "session_id": session.session_id,
         "repo_name": repo_path.name,
         "repo_path": str(repo_path),
         "output_dir": str(output_dir),
-        "languages": languages,
         "total_components": len(components),
         "total_leaf_nodes": len(leaf_nodes),
-        "leaf_nodes": leaf_nodes[:100],
-        "component_index": index,
-        "component_index_truncated": truncated,
+        "languages": languages,
+        "leaf_nodes_preview": leaf_nodes[:20],
+    }
+    workspace.write_json("summary.json", summary)
+
+    # -- Return compact MCP response --
+    result = {
+        "session_id": session.session_id,
+        "workspace_dir": str(workspace.root),
+        "repo_name": repo_path.name,
+        "output_dir": str(output_dir),
+        "stats": {
+            "total_components": len(components),
+            "total_leaf_nodes": len(leaf_nodes),
+            "languages": languages,
+        },
+        "files": {
+            "component_index": str(workspace.root / "component_index.json"),
+            "leaf_nodes": str(workspace.root / "leaf_nodes.json"),
+            "languages": str(workspace.root / "languages.json"),
+            "summary": str(workspace.root / "summary.json"),
+        },
         "changes": changes,
         "hint": (
+            "Read the files above for full data. "
             "Use read_code_components(session_id, component_ids) to read source code. "
             "Use save_module_tree(session_id, module_tree) after clustering. "
             "Call get_prompt('cluster') for clustering rules."
