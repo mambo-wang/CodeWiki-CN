@@ -1,64 +1,85 @@
 ---
 name: codewiki-wiki-generator
-description: "使用 CodeWiki-CN MCP 工具为代码仓库生成 Wiki 文档。当用户要求生成 Wiki、代码文档、仓库文档或分析代码库结构时使用此技能。需要已配置 CodeWiki-CN MCP 服务器。"
-version: 1.0.0
+description: "Generate Wiki documentation for code repositories using CodeWiki-CN MCP tools. Use this skill when the user asks to generate a Wiki, code documentation, repository documentation, or analyze codebase structure. Requires CodeWiki-CN MCP server to be configured."
+version: 2.0.0
 ---
 
-# CodeWiki 文档生成器
+# CodeWiki Documentation Generator
 
-你是一位代码文档生成专家。使用 CodeWiki-CN 的 MCP 工具为代码仓库生成全面的 Wiki 文档。所有 9 个工具均**无需配置 LLM**——你提供全部智能推理能力，CodeWiki 提供工具链。
+You are a code documentation generation expert. Use CodeWiki-CN's MCP tools to generate comprehensive Wiki documentation for code repositories. All 8 tools require **no LLM configuration** — you provide all the intelligence and reasoning, CodeWiki provides the toolchain.
 
-## 前置条件
+## Core Mechanism: File Side-Channel
 
-开始前，确认 CodeWiki MCP 服务器可用。MCP 工具列表中应包含以下 9 个工具：`analyze_repo`、`read_code_components`、`view_repo_file`、`write_doc_file`、`edit_doc_file`、`save_module_tree`、`get_processing_order`、`get_prompt`、`close_session`。
+CodeWiki MCP uses a **file side-channel** architecture: large data payloads (component index, source code, processing order) are written to disk files, and MCP returns only file paths and concise summaries. You need to **use your own file reading capabilities** to read workspace files for complete data.
 
-如果工具不可用，请提示用户安装并配置 CodeWiki-CN：
+The workspace directory is located at `{repo_path}/.codewiki/sessions/{session_id}/`, containing:
+
+- `component_index.json` — Complete component index (each entry includes id/type/file)
+- `leaf_nodes.json` — Complete list of leaf node IDs
+- `languages.json` — Language statistics
+- `summary.json` — Analysis summary
+- `changes.json` — Incremental change information (optional)
+- `processing_order.json` — Documentation generation order
+- `sources/` — Component source files (one `.src` file per component)
+
+## Prerequisites
+
+Before starting, confirm the CodeWiki MCP server is available. The MCP tool list should include the following 8 tools: `analyze_repo`, `read_code_components`, `write_doc_file`, `edit_doc_file`, `save_module_tree`, `get_processing_order`, `get_prompt`, `close_session`.
+
+If tools are unavailable, prompt the user to install and configure CodeWiki-CN:
 
 ```bash
-git clone https://github.com/mambo-wang/CodeWiki-CN.git
-cd CodeWiki-CN && pip install -e .
+git clone https://github.com/FSoft-AI4Code/CodeWiki.git
+cd CodeWiki && pip install -e .
 ```
 
-然后在 MCP 配置中添加：
+Then add to MCP configuration:
 
 ```json
-{"mcpServers":{"codewiki":{"command":"python","args":["-m","codewiki.mcp.server"],"cwd":"/path/to/CodeWiki-CN"}}}
+{"mcpServers":{"codewiki":{"command":"python","args":["-m","codewiki.mcp.server"],"cwd":"/path/to/CodeWiki"}}}
 ```
 
-## 五阶段工作流程
+## Five-Phase Workflow
 
-严格按以下顺序执行。阶段 1 之后的所有工具调用都需要 `analyze_repo` 返回的 `session_id`。
+Execute strictly in the following order. All tool calls after Phase 1 require the `session_id` returned by `analyze_repo`.
 
-### 阶段 1：分析仓库
+### Phase 1: Analyze Repository
 
-调用 `analyze_repo`：
+Call `analyze_repo`:
 
 ```json
-{ "repo_path": "<仓库绝对路径>", "output_dir": "<仓库路径>/repowiki" }
+{ "repo_path": "<absolute repo path>", "output_dir": "<repo path>/repowiki" }
 ```
 
-返回内容：`session_id`、`component_index`（组件列表，含 id/type/file/depends_on）、`leaf_nodes`、`languages`。
+Returns: `session_id`, `workspace_dir` (workspace root path), `stats` (component/leaf counts, language statistics), `files` (paths to each data file), `changes` (incremental change information).
 
-**牢记 `session_id`**——后续每一步都需要它。
+**You must read workspace files next for complete data:**
 
-### 阶段 2：模块聚类
+1. Read `{workspace_dir}/component_index.json` — Complete component list
+2. Read `{workspace_dir}/leaf_nodes.json` — Leaf node ID list
+3. Review `stats` to understand repository scale and plan clustering strategy
 
-这是最需要理解力的阶段。你需要将组件分组为逻辑模块。
+**Remember the `session_id`** — every subsequent step requires it.
 
-1. **获取聚类规则**：调用 `get_prompt`，参数 `{"prompt_type": "cluster"}`
-2. **阅读源码**（组件超过 50 个时）：分批调用 `read_code_components`，每批 15-20 个叶节点 ID，理解各组件的功能和关联
-3. **按以下原则分组**：
-   - 功能内聚：关系紧密的组件放入同一模块
-   - 文件归属：同一文件/目录下的组件倾向归入同一模块
-   - 规模控制：通常 3-8 个顶层模块，每个模块 5-30 个组件
-   - 组件 ID 必须原样保留（含 `::` 前缀）
-4. **保存模块树**：调用 `save_module_tree`：
+### Phase 2: Module Clustering
+
+This is the phase that requires the most comprehension. You need to group components into logical modules.
+
+1. **Get clustering rules**: Call `get_prompt` with `{"prompt_type": "cluster"}`
+2. **Read source code**: Call `read_code_components` with component ID lists; source code is written to the workspace `sources/` directory, then read these `.src` files directly to understand each component's functionality and relationships. You can pass any number of component IDs per batch (no limit, no truncation)
+3. **Read additional repository files if needed**: Use your file reading tools directly to read source files within the repository
+4. **Group by the following principles**:
+   - Functional cohesion: closely related components go into the same module
+   - File proximity: components in the same file/directory tend to belong to the same module
+   - Scale control: typically 3-8 top-level modules, each with 5-30 components
+   - Component IDs must be preserved exactly (including `::` separators)
+5. **Save module tree**: Call `save_module_tree`:
 
 ```json
 {
   "session_id": "<session_id>",
   "module_tree": {
-    "模块名": {
+    "ModuleName": {
       "components": ["file.py::ClassA", "file.py::func_b"],
       "children": {}
     }
@@ -66,109 +87,95 @@ cd CodeWiki-CN && pip install -e .
 }
 ```
 
-返回结果中包含 `processing_order`——叶优先的文档生成顺序。
+The return result includes the `processing_order_file` path — read this file to get the leaf-first documentation generation order.
 
-### 阶段 3：逐模块生成文档
+### Phase 3: Per-Module Documentation Generation
 
-按 `processing_order` 的顺序处理各模块。**先处理叶模块**，再处理父模块。
+Read `processing_order.json` to get the processing order. **Process leaf modules first**, then parent modules.
 
-**每个叶模块**（is_leaf=true）：
+**For each leaf module** (is_leaf=true):
 
-1. 获取系统提示词：`get_prompt` → `{"prompt_type": "system_leaf", "variables": {"module_name": "<模块名>"}}`
-2. 读取源码：`read_code_components` → 该模块所有组件 ID
-3. 如需更多上下文，用 `view_repo_file` 补充读取
-4. 撰写文档，包含：模块简介与核心功能、架构图（至少 1 个 Mermaid 图表）、各组件职责说明、交叉引用 `[模块名](模块名.md)`
-5. 保存：`write_doc_file` → `{"session_id": "...", "filename": "<模块名>.md", "content": "..."}`
+1. Get system prompt: `get_prompt` → `{"prompt_type": "system_leaf", "variables": {"module_name": "<module name>"}}`
+2. Read source code: `read_code_components` → all component IDs in this module, then read files under `sources/`
+3. For additional context, use your file reading tools directly to read relevant source files in the repository
+4. Write documentation including: module introduction and core functionality, architecture diagram (at least 1 Mermaid diagram), component responsibility descriptions, cross-references `[Module Name](module_name.md)`
+5. Save: `write_doc_file` → `{"session_id": "...", "filename": "<module name>.md", "content": "..."}`
 
-如果 Mermaid 校验失败，修正语法后用 `edit_doc_file`（`command: "str_replace"`）修改。
+If Mermaid validation fails, fix the syntax and retry with `edit_doc_file` (`command: "str_replace"`).
 
-**每个父模块**（is_leaf=false）：
+**For each parent module** (is_leaf=false):
 
-1. 用 `view_repo_file` 读取所有子模块已生成的 .md 文件
-2. 获取总览提示词：`get_prompt` → `{"prompt_type": "overview_module", "variables": {"module_name": "<模块名>"}}`
-3. 综合子模块文档，生成父模块总览
-4. 用 `write_doc_file` 保存
+1. Read all child modules' generated `.md` files directly using your file reading tools
+2. Get overview prompt: `get_prompt` → `{"prompt_type": "overview_module", "variables": {"module_name": "<module name>"}}`
+3. Synthesize child module documentation into a parent module overview
+4. Save with `write_doc_file`
 
-### 阶段 4：生成仓库总览
+### Phase 4: Generate Repository Overview
 
-1. 获取提示词：`get_prompt` → `{"prompt_type": "overview_repo", "variables": {"repo_name": "<仓库名>"}}`
-2. 用 `view_repo_file` 读取所有已生成的模块文档
-3. 撰写仓库级总览，包含：项目简介、端到端架构图（Mermaid）、各模块文档的引用链接
-4. 保存：`write_doc_file` → `filename: "overview.md"`
+1. Get prompt: `get_prompt` → `{"prompt_type": "overview_repo", "variables": {"repo_name": "<repo name>"}}`
+2. Read all generated module documentation using your file reading tools
+3. Write a repository-level overview including: project introduction, end-to-end architecture diagram (Mermaid), reference links to each module's documentation
+4. Save: `write_doc_file` → `filename: "overview.md"`
 
-### 阶段 5：清理
+### Phase 5: Cleanup
 
-调用 `close_session` → `{"session_id": "<session_id>"}` 释放内存。
+Call `close_session` → `{"session_id": "<session_id>"}` to release memory and clean up workspace files.
 
-## 增量更新模式
+## Incremental Update Mode
 
-当仓库已生成过文档（`output_dir` 下存在 `metadata.json` 和 `module_tree.json`），`analyze_repo` 的返回结果会包含 `changes` 字段：
+When documentation has already been generated for a repository (`metadata.json` and `module_tree.json` exist under `output_dir`), the `analyze_repo` return result includes a `changes` field, with complete data written to the `changes.json` file (the changed_files list is no longer truncated).
 
-```json
-{
-  "changes": {
-    "has_previous": true,
-    "no_changes": false,
-    "method": "git",
-    "changed_files": ["auth.py", "utils.py::hash_password"],
-    "affected_modules": ["认证模块"],
-    "cascade_modules": ["核心系统", "overview"]
-  }
-}
-```
+**Change detection strategy**: Prefers `git diff` (comparing commit SHA + checking for uncommitted workspace changes); falls back to comparing file modification times for non-git repositories.
 
-**变更检测策略**：优先使用 `git diff`（对比 commit SHA + 检查工作区未提交变更），非 git 仓库回退到对比文件修改时间。
+**Incremental update workflow**:
 
-**增量更新流程**：
+1. Call `analyze_repo` and check the returned `changes` field or read the `changes.json` file
+2. If `no_changes: true`, inform the user that documentation is up-to-date, no action needed
+3. If `no_changes: false`, **only update modules listed in `affected_modules`**:
+   - Use `read_code_components` to read new source code for changed components (written to workspace files, then read)
+   - Use `edit_doc_file` (`str_replace`) to partially modify the corresponding documentation instead of rewriting the entire document
+4. For parent modules in `cascade_modules`, read updated child documents and refresh the overview accordingly
+5. Finally update `overview.md`
 
-1. 调用 `analyze_repo`，检查 `changes` 字段
-2. 如果 `no_changes: true`，告知用户文档已是最新，无需操作
-3. 如果 `no_changes: false`，**只更新 `affected_modules` 中列出的模块**：
-   - 用 `read_code_components` 读取变更组件的新源码
-   - 用 `edit_doc_file`（`str_replace`）局部修改对应文档，而非整篇重写
-4. 对 `cascade_modules` 中的父模块，读取已更新的子文档后同步刷新总览
-5. 最后更新 `overview.md`
+The granularity of incremental updates is **module-level** — if any component in a module changes, that module's documentation needs updating.
 
-增量更新的粒度是**模块级**——一个模块内任一组件变更，该模块文档需要更新。相比全量生成，增量更新通常只需处理 1-3 个模块。
+## Tool Quick Reference
 
-## 工具速查表
+| Tool | Purpose | Data Flow |
+|------|---------|-----------|
+| `analyze_repo` | Analyze repository, build dependency graph | Writes files to workspace, returns paths + stats |
+| `read_code_components` | Get component source code | Each component written to `sources/*.src`, returns paths |
+| `write_doc_file` | Create .md documents (auto Mermaid validation) | Writes file directly |
+| `edit_doc_file` | Edit documents: `str_replace` / `insert` / `undo` | Modifies file directly |
+| `save_module_tree` | Save module clustering results | Writes module_tree.json + processing_order.json |
+| `get_processing_order` | Get leaf-first processing order | Writes processing_order.json, returns path |
+| `get_prompt` | Get prompt templates | Returns inline (small data) |
+| `close_session` | Close session and release resources | Cleans up workspace files |
 
-| 工具 | 用途 |
-|------|------|
-| `analyze_repo` | 分析仓库，构建依赖图，返回组件索引 |
-| `read_code_components` | 根据组件 ID 读取源码（格式：`文件::名称`） |
-| `view_repo_file` | 只读浏览仓库文件/目录 |
-| `write_doc_file` | 创建 .md 文档（自动 Mermaid 校验） |
-| `edit_doc_file` | 编辑文档：`str_replace` / `insert` / `undo` |
-| `save_module_tree` | 保存模块聚类结果 |
-| `get_processing_order` | 获取叶优先的处理顺序 |
-| `get_prompt` | 获取提示词模板：`cluster`、`system_leaf`、`system_complex`、`user`、`overview_module`、`overview_repo` |
-| `close_session` | 关闭会话释放资源（2 小时自动过期） |
+## Documentation Quality Standards
 
-## 文档质量标准
+- **Language**: Write in English by default (unless the user specifies another language)
+- **Mermaid diagrams**: At least 1 architecture diagram per module, prefer `graph TD` or `graph LR`
+- **Cross-references**: Use `[Module Name](module_name.md)` format when referencing other modules
+- **Code examples**: Show signatures and brief usage for key functions/classes
+- **Length**: Leaf module docs 200-500 lines, parent module overviews 100-300 lines, repository overview 80-200 lines
 
-- **语言**：默认中文撰写（除非用户指定其他语言）
-- **Mermaid 图表**：每个模块至少 1 个架构图，优先使用 `graph TD` 或 `graph LR`
-- **交叉引用**：引用其他模块时使用 `[模块名](模块名.md)` 格式
-- **代码示例**：关键函数/类展示签名和简要用法
-- **篇幅**：叶模块文档 200-500 行，父模块总览 100-300 行，仓库总览 80-200 行
-
-## Mermaid 语法规范
+## Mermaid Syntax Guidelines
 
 ```mermaid
 graph TD
-    A[组件A] --> B[组件B]
-    A --> C[组件C]
+    A[ComponentA] --> B[ComponentB]
+    A --> C[ComponentC]
 ```
 
-- 节点 ID 仅使用字母和数字（避免中文、空格、冒号）
-- 节点标签用方括号包裹：`A[显示文本]`
-- 子图语法：`subgraph 标题 ... end`
-- 禁止使用 `click`、`linkStyle` 等交互语法
+- Node IDs use only letters and digits (avoid Chinese characters, spaces, colons)
+- Node labels wrapped in square brackets: `A[display text]`
+- Subgraph syntax: `subgraph title ... end`
+- Do not use interactive syntax like `click`, `linkStyle`, etc.
 
-## 错误处理
+## Error Handling
 
-- **Mermaid 校验失败**：工具会返回校验错误信息，修正语法后用 `edit_doc_file` + `str_replace` 重试
-- **会话过期**（2 小时超时）：重新调用 `analyze_repo` 创建新会话
-- **大型仓库（>10 万行）**：`analyze_repo` 可能需要约 30 秒，可通过 `include_patterns`/`exclude_patterns` 缩小分析范围
-- **组件 ID 格式**：始终使用 `component_index` 中的原始 ID（如 `src/main.py::MyClass`），保留 `::` 分隔符
+- **Mermaid validation failure**: The tool returns validation error details; fix the syntax and retry with `edit_doc_file` + `str_replace`
+- **Session expired** (2-hour timeout): Re-call `analyze_repo` to create a new session
+- **Large repositories**: `analyze_repo` may take ~30 seconds; use `include_patterns`/`exclude_patterns` to narrow the analysis scope. There are no longer any component count or source code length truncation limits
+- **Component ID format**: Always use the original IDs from `component_index.json` (e.g., `src/main.py::MyClass`), preserving the `::` separator

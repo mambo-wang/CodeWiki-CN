@@ -1,128 +1,123 @@
-# CodeWiki IDE 驱动模式：改造过程与使用指南
+# CodeWiki IDE-Driven Mode: Refactoring Process & Usage Guide
 
-## 背景与动机
+## Background & Motivation
 
-CodeWiki 原始设计需要用户自行配置 LLM API（API Key + base_url），然后通过 CLI 一键生成文档。这带来两个问题：
+The original CodeWiki design required users to configure their own LLM API (API Key + base_url), then generate documentation via a one-shot CLI command. This introduced two problems:
 
-1. **配置门槛**：用户需要申请 API Key、了解 provider 差异、处理模型兼容性
-2. **灵活性不足**：生成过程是黑盒的，用户无法在过程中干预聚类策略或文档风格
+1. **Configuration barrier**: Users need to obtain API Keys, understand provider differences, and handle model compatibility issues
+2. **Inflexibility**: The generation process is a black box — users cannot intervene in clustering strategies or documentation style during generation
 
-**改造目标**：将 CodeWiki 退化为**纯工具链 MCP Server**，由 AI IDE（CodeBuddy、Cursor 等）的 Agent 全权驱动 Wiki 生成流水线，实现**零 LLM 配置**。
+**Refactoring goal**: Reduce CodeWiki to a **pure toolchain MCP Server**, fully driven by AI IDE agents (CodeBuddy, Cursor, etc.) to execute the Wiki generation pipeline with **zero LLM configuration**.
 
 ---
 
-## 改造过程
+## Refactoring Process
 
-### 架构分析
+### Architecture Analysis
 
-通过源码分析，CodeWiki 的 Wiki 生成流水线在 4 个环节依赖 LLM：
+Through source code analysis, CodeWiki's Wiki generation pipeline depends on LLM in 4 stages:
 
-| 环节 | 代码位置 | 调用方式 | LLM 作用 |
-|------|---------|---------|---------|
-| 模块聚类 | `cluster_modules.py` | `backend.complete()` | 将组件分组为逻辑模块 |
-| 每模块文档 | `pydantic_ai_backend.py` | `agent.run()` 多轮对话 | 读代码、写文档、画 Mermaid 图 |
-| 子模块递归 | `generate_sub_module_documentations.py` | 子 Agent 循环 | 递归处理嵌套模块 |
-| 父模块总览 | `documentation_generator.py` | `backend.complete()` | 从子文档合成概述 |
+| Stage | Code Location | Invocation | LLM Role |
+|-------|---------------|------------|----------|
+| Module clustering | `cluster_modules.py` | `backend.complete()` | Group components into logical modules |
+| Per-module documentation | `pydantic_ai_backend.py` | `agent.run()` multi-turn | Read code, write docs, draw Mermaid diagrams |
+| Sub-module recursion | `generate_sub_module_documentations.py` | Sub-agent loop | Recursively handle nested modules |
+| Parent module overview | `documentation_generator.py` | `backend.complete()` | Synthesize overviews from child documents |
 
-关键发现：**依赖分析（Tree-sitter AST 解析）、依赖图构建、拓扑排序、Mermaid 校验** 这套核心工具链完全不需要 LLM。
+Key finding: **dependency analysis (Tree-sitter AST parsing), dependency graph construction, topological sorting, and Mermaid validation** — the core toolchain — requires no LLM at all.
 
-### 改造策略
+### Refactoring Strategy
 
-将 MCP Server 从"黑盒式一键生成"拆分为"细粒度工具集"：
+Transform the MCP Server from "black-box one-shot generation" into a "fine-grained toolset":
 
 ```
-改造前：
-  IDE → generate_docs(repo) → [CodeWiki 内部自己调 LLM] → 结果
+Before refactoring:
+  IDE → generate_docs(repo) → [CodeWiki internally calls LLM] → result
 
-改造后：
-  IDE Agent → analyze_repo → read_code → (Agent 自己推理聚类) → write_doc → overview
-              ↑ 纯工具调用    ↑ 纯工具调用   ↑ IDE 自己的 LLM      ↑ 纯工具调用
+After refactoring:
+  IDE Agent → analyze_repo → read_code → (Agent reasons clustering) → write_doc → overview
+              ↑ Pure tool call   ↑ Pure tool call  ↑ IDE's own LLM     ↑ Pure tool call
 ```
 
-### 新增文件清单
+### File Side-Channel Architecture
+
+A key design decision in the refactoring: instead of transmitting large payloads (component indexes, source code, processing order) through the MCP stdio channel — which required aggressive truncation and caused overflow errors — the server writes all bulky data to **per-session workspace files** on disk. The MCP response returns only file paths and a compact summary. The IDE agent then reads those files directly using its own file-access capabilities.
+
+This approach eliminates truncation limits entirely: component indexes, source code files, and processing orders are written in full, no matter how large the repository.
+
+### New File Inventory
 
 ```
 codewiki/mcp/
-├── server.py                  # 重构：11 个工具注册（9 新 + 2 遗留）
-├── session.py                 # 新增：会话状态管理（SessionStore）
+├── server.py                  # Refactored: 10 tool registrations (8 fine-grained + 2 legacy)
+├── session.py                 # Session state management (SessionStore, thread-safe)
+├── workspace.py               # Per-session file workspace (write/read/cleanup)
 └── tools/
-    ├── __init__.py            # 新增：工具包入口
-    ├── analysis.py            # 新增：analyze_repo 增强版
-    ├── code_reader.py         # 新增：read_code_components + view_repo_file
-    ├── doc_writer.py          # 新增：write_doc_file + edit_doc_file
-    ├── module_tree.py         # 新增：save_module_tree + get_processing_order
-    └── prompt_server.py       # 新增：get_prompt 提示词模板服务
+    ├── __init__.py            # Tool package entry point
+    ├── analysis.py            # analyze_repo with incremental change detection
+    ├── code_reader.py         # read_code_components (writes .src files to workspace)
+    ├── doc_writer.py          # write_doc_file + edit_doc_file (with path traversal guards)
+    ├── module_tree.py         # save_module_tree + get_processing_order
+    └── prompt_server.py       # get_prompt template service
 ```
 
-### MCP 工具集
+### MCP Toolset
 
-| 工具 | 用途 | 是否需要 LLM |
-|------|------|:---:|
-| `analyze_repo` | 分析仓库，构建依赖图，返回组件索引 | 否 |
-| `read_code_components` | 根据组件 ID 读取源码 | 否 |
-| `view_repo_file` | 只读浏览仓库中的文件/目录 | 否 |
-| `write_doc_file` | 创建 .md 文档（含 Mermaid 校验） | 否 |
-| `edit_doc_file` | 编辑文档（替换/插入/撤销） | 否 |
-| `save_module_tree` | 保存 IDE Agent 的模块聚类结果 | 否 |
-| `get_processing_order` | 获取叶优先的文档生成顺序 | 否 |
-| `get_prompt` | 获取各阶段的提示词模板 | 否 |
-| `close_session` | 关闭会话释放资源 | 否 |
-| `generate_docs` | [遗留] 一键生成（需配置 LLM） | **是** |
-| `get_module_tree` | [遗留] 获取已有模块树 | 否 |
+The server exposes **8 fine-grained tools** (zero LLM config) plus **2 legacy tools**:
 
-### 向后兼容
+| Tool | Purpose | Data Flow | Requires LLM |
+|------|---------|-----------|:---:|
+| `analyze_repo` | Parse repo, build dependency graph, detect incremental changes | Writes workspace files (component index, leaf nodes, languages, changes), returns paths + stats | No |
+| `read_code_components` | Write component source code to workspace `.src` files | Each component → `sources/{sanitized_id}.src`, returns file paths | No |
+| `write_doc_file` | Create .md documents with auto Mermaid validation | Writes file directly to output dir | No |
+| `edit_doc_file` | Edit documents: `str_replace` / `insert` / `undo` | Modifies file in place, keeps edit history (capped at 20/file) | No |
+| `save_module_tree` | Persist IDE agent's module clustering | Writes `module_tree.json` + `first_module_tree.json` + `processing_order.json` | No |
+| `get_processing_order` | Compute leaf-first processing order | Writes `processing_order.json` to workspace, returns path | No |
+| `get_prompt` | Retrieve prompt templates for each pipeline stage | Returns inline (small payload) | No |
+| `close_session` | Write `metadata.json`, clean up workspace files, free memory | Cleans workspace dir + prunes empty parent dirs | No |
+| `generate_docs` | [Legacy] One-shot generation (requires `codewiki config set`) | Full pipeline | **Yes** |
+| `get_module_tree` | [Legacy] Get existing module clustering tree | Reads from disk | No |
 
-- 现有 CLI（`codewiki generate`、`codewiki config`）完全不变
-- 现有 Web App 完全不变
-- 遗留 MCP 工具 `generate_docs` 保留，已配置 LLM 的用户仍可使用
+### Thread Safety & Concurrency
+
+Synchronous tool handlers (file I/O, Tree-sitter parsing) run via `asyncio.to_thread()` to prevent blocking the MCP stdio event loop. The exception is `analyze_repo` — Tree-sitter C extensions are not thread-safe, so it runs on the main thread (acceptable for a one-time heavy operation).
+
+Session management is fully thread-safe: `SessionStore` uses a mutex lock for all read/write operations, supports up to **10 concurrent sessions** (oldest evicted at capacity), and sessions auto-expire after **2 hours** of inactivity.
+
+### Security Hardening
+
+The `doc_writer` module enforces path traversal guards: all file paths are resolved and verified to stay within the session's `output_dir`. Filenames that attempt directory escape are rejected. Edit operations are tracked in session-scoped history (capped at 20 entries per file to prevent unbounded memory growth).
+
+### Backward Compatibility
+
+- Existing CLI (`codewiki generate`, `codewiki config`) remains completely unchanged
+- Existing Web App remains completely unchanged
+- Legacy MCP tools (`generate_docs`, `get_module_tree`) are preserved — users with configured LLMs can still use them
+- The `codewiki/__init__.py` unconditional CLI import was removed, so MCP Server can now start without installing CLI-specific dependencies (`keyring`, `click`, etc.)
 
 ---
 
-## 使用方法
+## Usage
 
-### 前置条件
+### Prerequisites
 
 ```bash
-# 1. 克隆项目
+# 1. Clone the project
 git clone https://github.com/mambo-wang/CodeWiki-CN.git
 cd CodeWiki-CN
 
-# 2. 安装依赖
+# 2. Install dependencies
 pip install -e .
 
-# 3. 验证
+# 3. Verify
 python -c "from codewiki.mcp.server import server; print('MCP Server OK')"
 ```
 
-### CodeBuddy 配置
+### CodeBuddy Configuration
 
-**步骤 1**：在 CodeBuddy 中配置 MCP Server。
+**Step 1**: Configure the MCP Server in CodeBuddy.
 
-在 CodeBuddy 的 MCP 配置中添加：
-
-```json
-{
-  "mcpServers": {
-    "codewiki": {
-      "command": "python",
-      "args": ["-m", "codewiki.mcp.server"],
-      "cwd": "/path/to/CodeWiki-CN"
-    }
-  }
-}
-```
-
-**步骤 2**：项目规则已自动配置在 `.codebuddy/rules/codewiki-wiki-generator/RULE.mdc`。当你在 Agent 模式中提及"生成文档"或"Wiki"时，CodeBuddy 会自动加载该规则。
-
-**步骤 3**：打开 CodeBuddy Agent 模式，输入：
-
-```
-帮我分析这个仓库并生成 Wiki 文档
-```
-
-### Cursor 配置
-
-**步骤 1**：在 Cursor Settings → MCP 中添加 Server：
+Add to CodeBuddy's MCP configuration:
 
 ```json
 {
@@ -136,17 +131,17 @@ python -c "from codewiki.mcp.server import server; print('MCP Server OK')"
 }
 ```
 
-**步骤 2**：项目规则已配置在 `.cursorrules`，Cursor 打开项目后自动加载。
+**Step 2**: Project rules are automatically configured in `.codebuddy/rules/codewiki-wiki-generator/RULE.mdc`. When you mention "generate documentation" or "Wiki" in Agent mode, CodeBuddy automatically loads this rule.
 
-**步骤 3**：在 Cursor Agent 模式中输入：
+**Step 3**: Open CodeBuddy Agent mode and enter:
 
 ```
-请为当前仓库生成 Wiki 文档，输出到 docs 目录。
+Analyze this repository and generate Wiki documentation for me
 ```
 
-### Claude Desktop 配置
+### Cursor Configuration
 
-在 `~/Library/Application Support/Claude/claude_desktop_config.json`（macOS）中添加：
+**Step 1**: Add the Server in Cursor Settings → MCP:
 
 ```json
 {
@@ -160,68 +155,97 @@ python -c "from codewiki.mcp.server import server; print('MCP Server OK')"
 }
 ```
 
-### 其他支持 MCP 的 IDE
+**Step 2**: Project rules are configured in `.cursorrules` and automatically loaded when Cursor opens the project.
 
-任何支持 MCP stdio 协议的 AI IDE 均可使用，配置方式类似——指定 `command: python`、`args: ["-m", "codewiki.mcp.server"]`。
+**Step 3**: In Cursor Agent mode, enter:
+
+```
+Please generate Wiki documentation for the current repository, output to the docs directory.
+```
+
+### Claude Desktop Configuration
+
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS):
+
+```json
+{
+  "mcpServers": {
+    "codewiki": {
+      "command": "python",
+      "args": ["-m", "codewiki.mcp.server"],
+      "cwd": "/path/to/CodeWiki-CN"
+    }
+  }
+}
+```
+
+### Other MCP-Capable IDEs
+
+Any AI IDE supporting the MCP stdio protocol can be used with similar configuration — specify `command: python`, `args: ["-m", "codewiki.mcp.server"]`.
 
 ---
 
-## IDE Agent 工作流程
+## IDE Agent Workflow
 
-当你在 AI IDE 中触发 Wiki 生成时，Agent 会按以下 5 个阶段工作：
+When you trigger Wiki generation in an AI IDE, the Agent works through the following 5 phases:
 
 ```
-阶段 1: analyze_repo
-  │  → 得到 session_id、组件索引、叶节点列表
+Phase 1: analyze_repo
+  │  → Get session_id, workspace_dir, stats, file paths
+  │  → Read workspace files: component_index.json, leaf_nodes.json, languages.json
   │
-阶段 2: get_prompt("cluster") + read_code_components + save_module_tree
-  │  → Agent 自己推理，将组件分组为 3-8 个逻辑模块
-  │  → 得到叶优先的处理顺序
+Phase 2: get_prompt("cluster") + read_code_components + save_module_tree
+  │  → Agent reasons independently, groups components into 3-8 logical modules
+  │  → Source code written to workspace sources/ dir, agent reads .src files directly
+  │  → Get leaf-first processing order from processing_order.json
   │
-阶段 3: 逐模块生成
-  │  对每个叶模块：
-  │  ├── get_prompt("system_leaf") → 获取文档撰写指令
-  │  ├── read_code_components → 读源码
-  │  ├── view_repo_file → 按需补充读取
-  │  └── write_doc_file → 写出 .md（自动 Mermaid 校验）
+Phase 3: Per-module generation
+  │  For each leaf module:
+  │  ├── get_prompt("system_leaf") → Get documentation writing instructions
+  │  ├── read_code_components → Source written to sources/*.src, read directly
+  │  └── write_doc_file → Write .md (auto Mermaid validation)
   │
-  │  对每个父模块：
-  │  ├── 读取子模块 .md 文件
-  │  ├── get_prompt("overview_module") → 获取总览指令
-  │  └── write_doc_file → 写出总览
+  │  For each parent module:
+  │  ├── Read child module .md files
+  │  ├── get_prompt("overview_module") → Get overview instructions
+  │  └── write_doc_file → Write overview
   │
-阶段 4: get_prompt("overview_repo") → 生成仓库总览 overview.md
+Phase 4: get_prompt("overview_repo") → Generate repository overview overview.md
   │
-阶段 5: close_session → 释放资源
+Phase 5: close_session → Write metadata.json, clean up workspace, release resources
 ```
 
 ---
 
-## 增量更新
+## Incremental Updates
 
-### 原版 `--update` 的问题
+### Problems with the Original `--update`
 
-原始 CodeWiki CLI 提供了 `codewiki generate --update` 增量更新命令，但存在一个 bug：CLI 适配器创建 `DocumentationGenerator` 时未传入 `commit_id`，导致 `metadata.json` 中 `commit_id` 始终为 `null`。`_detect_changed_files()` 读到 `null` 后直接退化为全量生成。只有 Web 模式（`background_worker.py`）才正确写入了 `commit_id`，所以 CLI 下的 `--update` 实际上**永远等同于全量生成**。
+The original CodeWiki CLI provided a `codewiki generate --update` incremental update command, but had a bug: the CLI adapter did not pass `commit_id` when creating `DocumentationGenerator`, causing `commit_id` in `metadata.json` to always be `null`. When `_detect_changed_files()` reads `null`, it falls back to full generation. Only Web mode (`background_worker.py`) correctly writes `commit_id`, so under CLI, `--update` is effectively **always equivalent to full generation**.
 
-### MCP 增量更新方案
+This was fixed: the CLI adapter now passes `commit_id` correctly, and the MCP `close_session` tool writes `metadata.json` (with current git commit + timestamp) before cleaning up the workspace, establishing the baseline for future incremental detection.
 
-我们在 `analyze_repo` 工具中重新实现了增量检测，并将其升级为双策略模式：
+### MCP Incremental Update Solution
+
+Incremental detection is built into the `analyze_repo` tool with a dual-strategy approach:
 
 ```
-第一次调用 analyze_repo：
-  → 生成全量文档（changes 字段为 null）
+First call to analyze_repo:
+  → Generate full documentation (changes field is null)
+  → close_session writes metadata.json with commit_id + timestamp
 
-代码变更后再次调用 analyze_repo：
-  → 自动检测变更，返回 changes 字段
-  → AI Agent 只更新受影响的模块文档
+Subsequent call to analyze_repo after code changes:
+  → Automatically detect changes via git diff or mtime comparison
+  → Return changes field with affected_modules + cascade_modules
+  → AI Agent only updates affected module documentation
 ```
 
-**变更检测策略**（按优先级）：
+**Change detection strategies** (by priority):
 
-1. **Git 策略**：读取 `metadata.json` 中的 `commit_id`，与当前 HEAD 做 `git diff`，同时检查 `git status` 捕获未提交的变更
-2. **Mtime 策略**（非 git 仓库回退）：对比源文件修改时间与 `metadata.json` 中的 `timestamp`
+1. **Git strategy**: Read `commit_id` from `metadata.json`, run `git diff` against current HEAD, also check `git status` to capture uncommitted changes (modified + untracked files)
+2. **Mtime strategy** (fallback for non-git repos): Walk source files and compare modification times against `timestamp` in `metadata.json`
 
-**返回结构**：
+**Return structure**:
 
 ```json
 {
@@ -230,107 +254,124 @@ python -c "from codewiki.mcp.server import server; print('MCP Server OK')"
     "no_changes": false,
     "method": "git",
     "changed_files": ["auth.py"],
-    "affected_modules": ["认证模块"],
-    "cascade_modules": ["核心系统", "overview"]
+    "affected_modules": ["Authentication Module"],
+    "cascade_modules": ["Core System", "overview"],
+    "hint": "Only 1 module(s) need updating: ..."
   }
 }
 ```
 
-- `affected_modules`：直接受影响的模块，需要更新文档
-- `cascade_modules`：间接受影响的父模块（子文档变了，总览也要刷新）和 `overview`
+- `affected_modules`: Directly affected modules that need documentation updates
+- `cascade_modules`: Indirectly affected parent modules (child docs changed, so overviews must refresh) and `overview`
 
-### Agent 增量更新流程
+### Agent Incremental Update Workflow
 
-当 `analyze_repo` 返回 `changes` 且 `no_changes: false` 时，Agent 执行：
+When `analyze_repo` returns `changes` with `no_changes: false`, the Agent executes:
 
 ```
-1. 只处理 affected_modules 中的模块：
-   ├── read_code_components → 读取变更组件源码
-   └── edit_doc_file(str_replace) → 局部修改文档（而非整篇重写）
+1. Only process modules in affected_modules:
+   ├── read_code_components → Read changed component source code from workspace
+   └── edit_doc_file(str_replace) → Partially modify documentation (instead of full rewrite)
 
-2. 处理 cascade_modules 中的父模块：
-   ├── view_repo_file → 读取已更新的子文档
-   └── edit_doc_file → 刷新总览部分
+2. Process parent modules in cascade_modules:
+   ├── Read updated child documents
+   └── edit_doc_file → Refresh overview sections
 
-3. 最后更新 overview.md
+3. Finally update overview.md
 ```
 
-相比全量生成的 5 阶段流程，增量更新通常只需处理 1-3 个模块，耗时大幅缩短。
+Compared to the 5-phase full generation workflow, incremental updates typically only need to process 1-3 modules, significantly reducing time.
 
-### 实现细节
+### Implementation Details
 
-核心代码在 `codewiki/mcp/tools/analysis.py`，新增 4 个函数（约 170 行）：
+Core code is in `codewiki/mcp/tools/analysis.py`, with 4 dedicated functions (~170 lines):
 
-| 函数 | 职责 |
-|------|------|
-| `_detect_changes()` | 主入口，协调 git/mtime 策略，调用模块映射 |
-| `_detect_via_git()` | Git 检测：commit diff + uncommitted changes |
-| `_detect_via_mtime()` | Mtime 回退：扫描源文件修改时间 |
-| `_find_affected_modules()` | 子串匹配变更文件 → 模块映射（复用原版逻辑） |
+| Function | Responsibility |
+|----------|----------------|
+| `_detect_changes()` | Main entry point, coordinates git/mtime strategies, calls module mapping |
+| `_detect_via_git()` | Git detection: commit diff + uncommitted changes (modified + untracked) |
+| `_detect_via_mtime()` | Mtime fallback: walk source files, compare mtime against generation timestamp |
+| `_find_affected_modules()` | Substring matching changed files → module mapping (reuses original CLI logic) |
 
-`handle_analyze_repo()` 在构建完组件索引后调用 `_detect_changes()`，将结果附加到返回 JSON 的 `changes` 字段中。首次运行（无旧文档）时 `changes` 为 `null`，行为和之前完全一致。
-
-### 同时修复的架构问题
-
-改造过程中发现 `codewiki/__init__.py` 无条件 `import` 了 CLI 模块，导致启动 MCP Server 也必须安装 `keyring`、`click` 等 CLI 专属依赖。已将该 import 移除，MCP Server 现在可以轻量启动。CLI 入口（`__main__.py` 和 `pyproject.toml` 的 `codewiki = "codewiki.cli.main:cli"`）均直接从 `codewiki.cli.main` 导入，不受影响。
+`handle_analyze_repo()` calls `_detect_changes()` after building the component index, appending results to the `changes` field in the return JSON. On first run (no existing docs), `changes` is `null`, behavior is identical to before.
 
 ---
 
-## 输出结构
+## Workspace Lifecycle
 
-生成的文档结构与原始 CodeWiki 一致：
+Each `analyze_repo` call creates a session workspace at `{repo_path}/.codewiki/sessions/{session_id}/`:
+
+```
+.codewiki/sessions/{session_id}/
+├── component_index.json   # Full component index (id, type, file for each)
+├── leaf_nodes.json        # Complete leaf node ID list
+├── languages.json         # Language statistics
+├── changes.json           # Incremental change info (optional)
+├── summary.json           # Compact analysis summary
+├── processing_order.json   # Leaf-first generation order (after save_module_tree)
+└── sources/
+    └── {sanitized_id}.src # Individual component source files
+```
+
+The workspace is automatically cleaned up when `close_session` is called. Empty parent directories are pruned as well. Sessions that expire (2-hour TTL) or are evicted (max 10 concurrent) also trigger workspace cleanup.
+
+---
+
+## Output Structure
+
+The generated documentation structure is consistent with the original CodeWiki:
 
 ```
 docs/
-├── overview.md              # 仓库总览（从这里开始读）
-├── module1.md               # 各模块文档
+├── overview.md              # Repository overview (start reading here)
+├── module1.md               # Individual module documentation
 ├── module2.md               # ...
-├── module_tree.json         # 模块层级结构
-├── first_module_tree.json   # 初始聚类结果
-└── metadata.json            # 生成元数据
+├── module_tree.json         # Module hierarchy structure
+├── first_module_tree.json   # Initial clustering result (immutable snapshot)
+└── metadata.json            # Generation metadata (commit_id + timestamp)
 ```
 
 ---
 
-## 原始 CLI 模式（仍然可用）
+## Original CLI Mode (Still Available)
 
-如果你更喜欢命令行一键生成，原始方式完全不受影响：
+If you prefer one-shot command-line generation, the original method is completely unaffected:
 
 ```bash
-# 配置 LLM
+# Configure LLM
 codewiki config set \
   --provider openai-compatible \
   --api-key YOUR_KEY \
   --base-url https://api.example.com \
   --main-model claude-sonnet-4
 
-# 一键生成
+# One-shot generation
 codewiki generate
 ```
 
-详见 [README.md](README.md) 中的 Quick Start 章节。
+See the Quick Start section in [README.md](README.md) for details.
 
 ---
 
-## 常见问题
+## FAQ
 
-**Q: MCP Server 启动报错找不到依赖？**
-A: 确保已运行 `pip install -e .` 安装 CodeWiki 及其依赖。
+**Q: MCP Server fails to start with missing dependencies?**
+A: Make sure you have run `pip install -e .` to install CodeWiki and its dependencies. The MCP Server no longer requires CLI-specific packages like `keyring` or `click`.
 
-**Q: analyze_repo 分析很慢？**
-A: 大型仓库（>10 万行）的 Tree-sitter 解析需要一定时间，通常 30 秒内完成。可以通过 `--include` / `--exclude` 缩小分析范围。
+**Q: analyze_repo is slow?**
+A: Tree-sitter parsing for large repositories (>100K lines) takes some time, usually completing within 30 seconds. Use `include_patterns` / `exclude_patterns` to narrow the analysis scope. There are no component count or source code length truncation limits.
 
-**Q: Mermaid 校验报错？**
-A: Agent 会自动根据校验结果修正语法。如果反复失败，可以检查 `mermaid-py` 是否正确安装。
+**Q: Mermaid validation errors?**
+A: The Agent will automatically correct syntax based on validation results. If failures persist, check that `mermaid-py` is properly installed.
 
-**Q: 如何让 Agent 用英文写文档？**
-A: 在对话中明确指定："Please generate the Wiki documentation in English."
+**Q: How to have the Agent write documentation in a specific language?**
+A: Specify explicitly in the conversation: "Please generate the Wiki documentation in English." or "Please use Chinese for the documentation."
 
-**Q: 会话超时了怎么办？**
-A: 会话默认 2 小时超时。超时后重新调用 `analyze_repo` 即可创建新会话。
+**Q: What to do when a session times out?**
+A: Sessions default to a 2-hour TTL with a maximum of 10 concurrent sessions. After timeout or eviction, simply re-call `analyze_repo` to create a new session.
 
-**Q: 代码改了之后如何增量更新文档？**
-A: 直接对 AI Agent 说"更新 Wiki 文档"。Agent 调用 `analyze_repo` 时会自动检测变更，返回的 `changes` 字段会指出哪些模块受影响。Agent 只更新受影响的模块文档，而非全部重新生成。支持 git 仓库和非 git 仓库两种检测方式。
+**Q: How to incrementally update documentation after code changes?**
+A: Simply tell the AI Agent "update the Wiki documentation". When the Agent calls `analyze_repo`, it automatically detects changes and the returned `changes` field indicates which modules are affected. The Agent only updates affected module documentation instead of regenerating everything. Supports both git and non-git repository detection.
 
-**Q: 增量更新的粒度是什么？**
-A: 模块级。一个模块内任一组件的源文件变更，该模块的整篇文档会被标记为需要更新。同时其父模块的总览也会被标记（级联更新）。`overview.md` 在任何变更时都会刷新。
+**Q: What is the granularity of incremental updates?**
+A: Module-level. If any component's source file in a module changes, that module's entire documentation is marked for update. Its parent module's overview is also marked (cascading update). `overview.md` is refreshed whenever any change occurs.
