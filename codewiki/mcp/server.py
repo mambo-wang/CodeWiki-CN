@@ -5,14 +5,17 @@ Provides two sets of tools:
 
 **Fine-grained tools (IDE-driven, zero LLM config):**
   - ``analyze_repo``      — Parse a repo and build a dependency graph (session-based)
-  - ``read_code_components`` — Read source code for given component IDs
-  - ``view_repo_file``    — Read-only file/directory browsing
+  - ``read_code_components`` — Write component source code to workspace files
   - ``write_doc_file``    — Create a documentation .md file with Mermaid validation
   - ``edit_doc_file``     — Edit a documentation file (str_replace / insert / undo)
   - ``save_module_tree``  — Persist IDE agent's module clustering
   - ``get_processing_order`` — Get leaf-first documentation order
   - ``get_prompt``        — Retrieve CodeWiki's prompt templates
-  - ``close_session``     — Clean up a session
+  - ``close_session``     — Clean up a session and workspace files
+
+Large analysis results (component index, source code, processing order) are
+written to workspace files on disk.  The IDE agent reads these files directly
+instead of receiving large payloads through the MCP stdio channel.
 
 **Legacy tools (require CodeWiki LLM config):**
   - ``generate_docs``     — Full documentation generation (black-box)
@@ -43,7 +46,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
-from codewiki.mcp.session import SessionStore
+from codewiki.mcp.session import SessionState, SessionStore
 
 logger = logging.getLogger(__name__)
 
@@ -69,14 +72,16 @@ def _fine_grained_tools() -> list[Tool]:
             name="analyze_repo",
             description=(
                 "Analyze a code repository's structure, dependencies, and components "
-                "using Tree-sitter AST parsing. Returns a component index and leaf nodes. "
-                "No LLM required. This is the entry point for the wiki generation pipeline. "
+                "using Tree-sitter AST parsing. No LLM required. "
+                "Writes the full component index, leaf nodes, and language stats to "
+                "workspace files on disk, and returns file paths plus a compact summary. "
+                "Read the workspace files for complete data. "
+                "This is the entry point for the wiki generation pipeline. "
                 "After calling this, use get_prompt('cluster') to learn clustering rules, "
                 "then save_module_tree to persist your grouping. "
                 "INCREMENTAL UPDATE: If docs already exist in output_dir (metadata.json + "
                 "module_tree.json), the response includes a 'changes' field showing which "
-                "files changed and which modules need updating. Use this to do targeted "
-                "edits instead of regenerating everything."
+                "files changed and which modules need updating."
             ),
             inputSchema={
                 "type": "object",
@@ -104,9 +109,10 @@ def _fine_grained_tools() -> list[Tool]:
         Tool(
             name="read_code_components",
             description=(
-                "Read the source code for a list of component IDs. "
+                "Write the source code for a list of component IDs to workspace files. "
                 "Component IDs have the form 'file_path::ComponentName'. "
-                "Returns the source code with language-aware code fences."
+                "Each component's full source is written to an individual .src file "
+                "in the session's sources/ directory. Returns file paths — no truncation."
             ),
             inputSchema={
                 "type": "object",
@@ -122,32 +128,6 @@ def _fine_grained_tools() -> list[Tool]:
                     },
                 },
                 "required": ["session_id", "component_ids"],
-            },
-        ),
-        Tool(
-            name="view_repo_file",
-            description=(
-                "Read-only view of a file or directory inside the analyzed repository. "
-                "Use this to explore code that isn't in the component index."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "session_id": {
-                        "type": "string",
-                        "description": "Session ID from analyze_repo",
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "Relative path within the repository",
-                    },
-                    "view_range": {
-                        "type": "array",
-                        "items": {"type": "integer"},
-                        "description": "Optional [start_line, end_line] (1-indexed, -1 for end)",
-                    },
-                },
-                "required": ["session_id", "path"],
             },
         ),
         Tool(
@@ -219,7 +199,8 @@ def _fine_grained_tools() -> list[Tool]:
             description=(
                 "Save the IDE agent's module clustering result. "
                 "Accepts a JSON module tree and persists it to disk. "
-                "Returns the recommended leaf-first processing order."
+                "Computes the leaf-first processing order and writes it to a workspace file. "
+                "Returns the file path for the processing order."
             ),
             inputSchema={
                 "type": "object",
@@ -242,8 +223,8 @@ def _fine_grained_tools() -> list[Tool]:
         Tool(
             name="get_processing_order",
             description=(
-                "Get the leaf-first processing order for documentation generation. "
-                "Process leaf modules (is_leaf=true) before parent modules."
+                "Compute and write the leaf-first processing order to a workspace file. "
+                "Returns the file path. Process leaf modules (is_leaf=true) before parent modules."
             ),
             inputSchema={
                 "type": "object",
@@ -380,17 +361,18 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     """Route tool calls to the appropriate handler."""
     try:
         # --- Fine-grained tools (no LLM config needed) ---
+        # Synchronous handlers run via asyncio.to_thread() so they never
+        # block the event loop (which would hang the MCP stdio server).
         if name == "analyze_repo":
             from codewiki.mcp.tools.analysis import handle_analyze_repo
+            # NOTE: Tree-sitter C extensions are not thread-safe, so this
+            # must run on the main thread (blocking the event loop is
+            # acceptable for this one-time heavy operation).
             return [_text(handle_analyze_repo(arguments, _store))]
 
         elif name == "read_code_components":
             from codewiki.mcp.tools.code_reader import handle_read_code_components
-            return [_text(handle_read_code_components(arguments, _store))]
-
-        elif name == "view_repo_file":
-            from codewiki.mcp.tools.code_reader import handle_view_repo_file
-            return [_text(handle_view_repo_file(arguments, _store))]
+            return [_text(await asyncio.to_thread(handle_read_code_components, arguments, _store))]
 
         elif name == "write_doc_file":
             from codewiki.mcp.tools.doc_writer import handle_write_doc_file
@@ -404,18 +386,24 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
 
         elif name == "save_module_tree":
             from codewiki.mcp.tools.module_tree import handle_save_module_tree
-            return [_text(handle_save_module_tree(arguments, _store))]
+            return [_text(await asyncio.to_thread(handle_save_module_tree, arguments, _store))]
 
         elif name == "get_processing_order":
             from codewiki.mcp.tools.module_tree import handle_get_processing_order
-            return [_text(handle_get_processing_order(arguments, _store))]
+            return [_text(await asyncio.to_thread(handle_get_processing_order, arguments, _store))]
 
         elif name == "get_prompt":
             from codewiki.mcp.tools.prompt_server import handle_get_prompt
-            return [_text(handle_get_prompt(arguments, _store))]
+            return [_text(await asyncio.to_thread(handle_get_prompt, arguments, _store))]
 
         elif name == "close_session":
             sid = arguments["session_id"]
+            session = _store.get(sid)
+            if session:
+                _write_generation_metadata(session)
+                # Clean up workspace files on disk
+                if session.workspace is not None:
+                    session.workspace.cleanup()
             removed = _store.remove(sid)
             return [_text(json.dumps({
                 "status": "closed" if removed else "not_found",
@@ -523,7 +511,7 @@ async def _legacy_get_module_tree(arguments: dict[str, Any]) -> list[TextContent
             "error": f"Module tree not found at {module_tree_path}. Run 'codewiki generate' first."
         }))]
 
-    module_tree = json.loads(module_tree_path.read_text())
+    module_tree = json.loads(module_tree_path.read_text(encoding="utf-8"))
 
     def _summarize_tree(tree, depth=0):
         lines = []
@@ -553,6 +541,39 @@ async def _legacy_get_module_tree(arguments: dict[str, Any]) -> list[TextContent
 
 def _text(content: str) -> TextContent:
     return TextContent(type="text", text=content)
+
+
+def _write_generation_metadata(session: SessionState) -> None:
+    """Write ``metadata.json`` to the session's output directory.
+
+    Records the current git commit and timestamp so that
+    :func:`_detect_changes` can diff against this baseline on the next
+    ``analyze_repo`` call, enabling incremental updates.
+    """
+    try:
+        output_dir = Path(session.output_dir)
+        repo_path = Path(session.repo_path)
+
+        commit_id: str | None = None
+        try:
+            import git
+            repo = git.Repo(repo_path, search_parent_directories=True)
+            commit_id = repo.head.commit.hexsha
+        except Exception:
+            pass
+
+        from datetime import datetime
+        metadata = {
+            "generation_info": {
+                "commit_id": commit_id,
+                "timestamp": datetime.now().isoformat(),
+            },
+        }
+        (output_dir / "metadata.json").write_text(
+            json.dumps(metadata, indent=2, ensure_ascii=False)
+        )
+    except Exception as e:
+        logger.warning("Failed to write metadata.json: %s", e)
 
 
 # ===================================================================
