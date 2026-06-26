@@ -103,8 +103,8 @@ The `doc_writer` module enforces path traversal guards: all file paths are resol
 
 ```bash
 # 1. Clone the project
-git clone https://github.com/mambo-wang/CodeWiki-CN.git
-cd CodeWiki-CN
+git clone https://github.com/FSoft-AI4Code/CodeWiki.git
+cd CodeWiki
 
 # 2. Install dependencies
 pip install -e .
@@ -125,7 +125,7 @@ Add to CodeBuddy's MCP configuration:
     "codewiki": {
       "command": "python",
       "args": ["-m", "codewiki.mcp.server"],
-      "cwd": "/path/to/CodeWiki-CN"
+      "cwd": "/path/to/CodeWiki"
     }
   }
 }
@@ -149,7 +149,7 @@ Analyze this repository and generate Wiki documentation for me
     "codewiki": {
       "command": "python",
       "args": ["-m", "codewiki.mcp.server"],
-      "cwd": "/path/to/CodeWiki-CN"
+      "cwd": "/path/to/CodeWiki"
     }
   }
 }
@@ -173,7 +173,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
     "codewiki": {
       "command": "python",
       "args": ["-m", "codewiki.mcp.server"],
-      "cwd": "/path/to/CodeWiki-CN"
+      "cwd": "/path/to/CodeWiki"
     }
   }
 }

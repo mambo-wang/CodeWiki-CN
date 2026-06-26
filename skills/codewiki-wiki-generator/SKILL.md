@@ -1,12 +1,12 @@
 ---
 name: codewiki-wiki-generator
-description: "Generate Wiki documentation for code repositories using CodeWiki-CN MCP tools. Use this skill when the user asks to generate a Wiki, code documentation, repository documentation, or analyze codebase structure. Requires CodeWiki-CN MCP server to be configured."
+description: "Generate Wiki documentation for code repositories using CodeWiki MCP tools. Use this skill when the user asks to generate a Wiki, code documentation, repository documentation, or analyze codebase structure. Requires CodeWiki MCP server to be configured."
 version: 2.0.0
 ---
 
 # CodeWiki Documentation Generator
 
-You are a code documentation generation expert. Use CodeWiki-CN's MCP tools to generate comprehensive Wiki documentation for code repositories. All 8 tools require **no LLM configuration** — you provide all the intelligence and reasoning, CodeWiki provides the toolchain.
+You are a code documentation generation expert. Use CodeWiki's MCP tools to generate comprehensive Wiki documentation for code repositories. All 8 tools require **no LLM configuration** — you provide all the intelligence and reasoning, CodeWiki provides the toolchain.
 
 ## Core Mechanism: File Side-Channel
 
@@ -26,7 +26,7 @@ The workspace directory is located at `{repo_path}/.codewiki/sessions/{session_i
 
 Before starting, confirm the CodeWiki MCP server is available. The MCP tool list should include the following 8 tools: `analyze_repo`, `read_code_components`, `write_doc_file`, `edit_doc_file`, `save_module_tree`, `get_processing_order`, `get_prompt`, `close_session`.
 
-If tools are unavailable, prompt the user to install and configure CodeWiki-CN:
+If tools are unavailable, prompt the user to install and configure CodeWiki:
 
 ```bash
 git clone https://github.com/FSoft-AI4Code/CodeWiki.git
