@@ -127,6 +127,8 @@ When documentation has already been generated for a repository (`metadata.json` 
 
 **Change detection strategy**: Prefers `git diff` (comparing commit SHA + checking for uncommitted workspace changes); falls back to comparing file modification times for non-git repositories.
 
+> **Note**: `metadata.json` is written only when `close_session` is called. Sessions that end without `close_session` leave no baseline, so the next `analyze_repo` falls back to full analysis. Always call `close_session` at the end of the workflow.
+
 **Incremental update workflow**:
 
 1. Call `analyze_repo` and check the returned `changes` field or read the `changes.json` file

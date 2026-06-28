@@ -570,7 +570,8 @@ def _write_generation_metadata(session: SessionState) -> None:
             },
         }
         (output_dir / "metadata.json").write_text(
-            json.dumps(metadata, indent=2, ensure_ascii=False)
+            json.dumps(metadata, indent=2, ensure_ascii=False),
+            encoding="utf-8",
         )
     except Exception as e:
         logger.warning("Failed to write metadata.json: %s", e)

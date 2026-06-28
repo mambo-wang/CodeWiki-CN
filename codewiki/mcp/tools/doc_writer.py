@@ -173,7 +173,7 @@ async def handle_edit_doc_file(
         lines = new_content.split("\n")
         start = max(0, replacement_line - 4)
         end = min(len(lines), start + new_str.count("\n") + 9)
-        snippet = "\n".join(f"{i + start + 1:6}\t{lines[i]}" for i in range(start, end))
+        snippet = "\n".join(f"{i + 1:6}\t{lines[i]}" for i in range(start, end))
 
     elif command == "insert":
         insert_line = arguments.get("insert_line", 0)
@@ -190,7 +190,7 @@ async def handle_edit_doc_file(
 
         start = max(0, insert_line - 4)
         end = min(len(lines), start + len(new_str_lines) + 8)
-        snippet = "\n".join(f"{i + start + 1:6}\t{lines[i]}" for i in range(start, end))
+        snippet = "\n".join(f"{i + 1:6}\t{lines[i]}" for i in range(start, end))
 
     else:
         return json.dumps({"error": f"Unknown command: {command}. Use str_replace, insert, or undo."})

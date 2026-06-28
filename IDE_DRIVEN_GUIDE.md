@@ -245,6 +245,8 @@ Subsequent call to analyze_repo after code changes:
 1. **Git strategy**: Read `commit_id` from `metadata.json`, run `git diff` against current HEAD, also check `git status` to capture uncommitted changes (modified + untracked files)
 2. **Mtime strategy** (fallback for non-git repos): Walk source files and compare modification times against `timestamp` in `metadata.json`
 
+> **Note**: `metadata.json` is written only when `close_session` is called. If a session ends without calling `close_session`, no baseline exists and the next `analyze_repo` silently falls back to full analysis. Always call `close_session` at the end of the workflow to ensure incremental updates work.
+
 **Return structure**:
 
 ```json
