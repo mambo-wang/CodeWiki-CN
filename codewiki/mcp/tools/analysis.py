@@ -12,7 +12,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -92,10 +91,11 @@ def _detect_via_git(
     repo_path: Path,
     metadata: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
-    """Detect changes via git. Returns None if not in a git repo.
+    """Detect changes via git. Returns None if not in a git repo or if no
+    previous commit is recorded (so the caller can fall through to mtime).
 
-    Checks both committed changes (diff against stored commit_id) and
-    uncommitted changes (``git status``).
+    Checks committed changes (diff against stored commit_id), staged changes
+    (``index.diff('HEAD')``), and unstaged/untracked changes.
     """
     try:
         import git
@@ -104,37 +104,67 @@ def _detect_via_git(
         return None
 
     prev_commit = metadata.get("generation_info", {}).get("commit_id")
+    if not prev_commit:
+        return None  # No baseline to compare; let mtime fallback handle it
+
     try:
         current_commit = repo.head.commit.hexsha
     except Exception:
         return None
 
+    # Compute subpath prefix for monorepo support.
+    # Git diff returns paths relative to the git root, but component IDs
+    # use paths relative to repo_path.  Strip the prefix so they align.
+    git_root = Path(repo.working_dir).resolve()
+    repo_root = repo_path.resolve()
+    try:
+        subpath = repo_root.relative_to(git_root).as_posix()
+    except ValueError:
+        subpath = ""
+    if subpath == ".":
+        subpath = ""
+
     changed: list[str] = []
     method = "git"
 
     # 1) Committed changes since last generation
-    if prev_commit and prev_commit != current_commit:
+    if prev_commit != current_commit:
         try:
             diff_index = repo.commit(prev_commit).diff(current_commit)
             seen: set[str] = set()
             for diff in diff_index:
-                if diff.a_path and diff.a_path not in seen:
-                    changed.append(diff.a_path)
-                    seen.add(diff.a_path)
-                if diff.b_path and diff.b_path not in seen:
-                    changed.append(diff.b_path)
-                    seen.add(diff.b_path)
+                for p in (diff.a_path, diff.b_path):
+                    if p and p not in seen:
+                        if subpath:
+                            if p.startswith(subpath + "/"):
+                                p = p[len(subpath) + 1:]
+                            else:
+                                continue  # outside target subdirectory
+                        changed.append(p)
+                        seen.add(p)
         except Exception:
             pass
 
-    # 2) Uncommitted changes (user may have edited but not committed)
+    # 2) Uncommitted changes: staged (index vs HEAD) + unstaged (working tree vs index) + untracked
     try:
+        for d in list(repo.index.diff("HEAD")) + list(repo.index.diff(None)):
+            p = d.a_path
+            if p and p not in changed:
+                if subpath:
+                    if p.startswith(subpath + "/"):
+                        p = p[len(subpath) + 1:]
+                    else:
+                        continue
+                changed.append(p)
         for item in repo.untracked_files:
-            if item not in changed:
-                changed.append(item)
-        for file_path in [d.a_path for d in repo.index.diff("HEAD")]:
-            if file_path and file_path not in changed:
-                changed.append(file_path)
+            p = item
+            if subpath:
+                if p.startswith(subpath + "/"):
+                    p = p[len(subpath) + 1:]
+                else:
+                    continue
+            if p not in changed:
+                changed.append(p)
     except Exception:
         pass
 
@@ -231,6 +261,38 @@ def _find_affected_modules(
     return affected, cascade
 
 
+def _build_symbol_map(
+    components: Dict[str, Any],
+) -> Dict[str, list[str]]:
+    """Build a mapping from symbol name to source file path(s).
+
+    Only includes class-like component types (class, interface, struct, enum,
+    record, annotation).  Returns ``{name: [relative_path, ...]}``.  Names that
+    appear in multiple files are stored as a list so the caller can disambiguate.
+    """
+    _LINKABLE_TYPES = {"class", "interface", "struct", "enum", "record", "annotation"}
+
+    symbol_map: Dict[str, list[str]] = {}
+    for comp_id, node in components.items():
+        ctype = getattr(node, "component_type", "")
+        if ctype not in _LINKABLE_TYPES:
+            continue
+        name = getattr(node, "name", "")
+        rel_path = getattr(node, "relative_path", "")
+        if not name or not rel_path:
+            continue
+        if name not in symbol_map:
+            symbol_map[name] = []
+        if rel_path not in symbol_map[name]:
+            symbol_map[name].append(rel_path)
+
+    # Sort file lists for deterministic output
+    for paths in symbol_map.values():
+        paths.sort()
+
+    return symbol_map
+
+
 def handle_analyze_repo(
     arguments: Dict[str, Any],
     store: SessionStore,
@@ -325,6 +387,52 @@ def handle_analyze_repo(
     }
     workspace.write_json("summary.json", summary)
 
+    # 6. LLM Wiki: auto-generate schema.yaml
+    schema_info = None
+    try:
+        from codewiki.mcp.tools.schema_generator import generate_schema
+        # Collect module names from existing module_tree.json (if any)
+        module_names: list[str] = []
+        mt_path = output_dir / "module_tree.json"
+        if mt_path.exists():
+            try:
+                mt = json.loads(mt_path.read_text(encoding="utf-8"))
+                if isinstance(mt, dict):
+                    module_names = list(mt.keys())
+            except (json.JSONDecodeError, OSError):
+                pass
+        schema_info = generate_schema(
+            repo_name=repo_path.name,
+            components=components,
+            languages=list(languages.keys()),
+            output_dir=output_dir,
+            module_names=module_names,
+        )
+        workspace.write_json("schema.json", schema_info)
+    except Exception as e:
+        logger.warning("Schema generation skipped: %s", e)
+
+    # LLM Wiki: update index.md and log.md
+    try:
+        from codewiki.mcp.tools.wiki_index import rebuild_index, append_log
+        append_log(str(output_dir), "analyze_repo",
+                   f"分析仓库 {repo_path.name}，{len(components)} 个组件")
+        rebuild_index(str(output_dir))
+    except Exception as e:
+        logger.warning("Index/log update failed (non-fatal): %s", e)
+
+    # LLM Wiki: build and persist symbol_map.json (class name → source file)
+    try:
+        symbol_map = _build_symbol_map(components)
+        symbol_map_path = output_dir / "symbol_map.json"
+        symbol_map_path.write_text(
+            json.dumps(symbol_map, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        logger.info("Symbol map written: %d symbols", len(symbol_map))
+    except Exception as e:
+        logger.warning("Symbol map generation failed (non-fatal): %s", e)
+
     # -- Return compact MCP response --
     result = {
         "session_id": session.session_id,
@@ -341,6 +449,7 @@ def handle_analyze_repo(
             "leaf_nodes": str(workspace.root / "leaf_nodes.json"),
             "languages": str(workspace.root / "languages.json"),
             "summary": str(workspace.root / "summary.json"),
+            "schema": str(workspace.root / "schema.json") if schema_info else None,
         },
         "changes": changes,
         "hint": (
