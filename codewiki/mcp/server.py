@@ -546,9 +546,9 @@ def _text(content: str) -> TextContent:
 def _write_generation_metadata(session: SessionState) -> None:
     """Write ``metadata.json`` to the session's output directory.
 
-    Records the current git commit and timestamp so that
-    :func:`_detect_changes` can diff against this baseline on the next
-    ``analyze_repo`` call, enabling incremental updates.
+    Merges the current git commit and timestamp into any existing metadata
+    so that stats from other workflows (e.g. CLI ``generate_docs``) are
+    preserved.
     """
     try:
         output_dir = Path(session.output_dir)
@@ -563,14 +563,23 @@ def _write_generation_metadata(session: SessionState) -> None:
             pass
 
         from datetime import datetime
-        metadata = {
-            "generation_info": {
-                "commit_id": commit_id,
-                "timestamp": datetime.now().isoformat(),
-            },
+
+        # Read existing metadata (if any) and merge
+        metadata_path = output_dir / "metadata.json"
+        existing: dict = {}
+        if metadata_path.exists():
+            try:
+                existing = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        existing["generation_info"] = {
+            **existing.get("generation_info", {}),
+            "commit_id": commit_id,
+            "timestamp": datetime.now().isoformat(),
         }
-        (output_dir / "metadata.json").write_text(
-            json.dumps(metadata, indent=2, ensure_ascii=False),
+        metadata_path.write_text(
+            json.dumps(existing, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
     except Exception as e:

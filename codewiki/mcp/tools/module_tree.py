@@ -19,12 +19,14 @@ from codewiki.src.config import FIRST_MODULE_TREE_FILENAME, MODULE_TREE_FILENAME
 logger = logging.getLogger(__name__)
 
 
-def _get_processing_order(module_tree: Dict[str, Any], parent_path: List[str] = []) -> List[Dict[str, Any]]:
+def _get_processing_order(module_tree: Dict[str, Any], parent_path: List[str] | None = None) -> List[Dict[str, Any]]:
     """Compute leaf-first processing order from a module tree.
 
     Returns a list of dicts with module path, name, leaf status, and
     component/children info.
     """
+    if parent_path is None:
+        parent_path = []
     order: List[Dict[str, Any]] = []
 
     def _collect(tree: Dict[str, Any], path: List[str]) -> None:

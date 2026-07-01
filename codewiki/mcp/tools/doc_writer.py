@@ -6,6 +6,7 @@ directory, with automatic Mermaid diagram validation after every write.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -86,14 +87,14 @@ async def handle_write_doc_file(
 
     content = arguments["content"]
 
-    _ensure_parent_dirs(doc_path)
+    await asyncio.to_thread(_ensure_parent_dirs, doc_path)
 
-    if doc_path.exists():
+    if await asyncio.to_thread(doc_path.exists):
         return json.dumps({
             "error": f"File already exists: {filename}. Use edit_doc_file to modify it."
         })
 
-    doc_path.write_text(content, encoding="utf-8")
+    await asyncio.to_thread(doc_path.write_text, content, "utf-8")
 
     # Mermaid validation
     mermaid_result = await _validate_mermaid(str(doc_path), filename)
@@ -136,7 +137,7 @@ async def handle_edit_doc_file(
         old_content = path_history.pop()
         history[str(doc_path)] = path_history
         session.registry["file_history"] = history
-        doc_path.write_text(old_content, encoding="utf-8")
+        await asyncio.to_thread(doc_path.write_text, old_content, "utf-8")
 
         # Validate Mermaid after undo
         mermaid_result = await _validate_mermaid(str(doc_path), filename)
@@ -146,11 +147,11 @@ async def handle_edit_doc_file(
             "mermaid_validation": mermaid_result,
         }, ensure_ascii=False)
 
-    if not doc_path.exists():
+    if not await asyncio.to_thread(doc_path.exists):
         return json.dumps({"error": f"File not found: {filename}. Use write_doc_file to create it."})
 
     # Save current content to history before editing
-    current_content = doc_path.read_text(encoding="utf-8")
+    current_content = await asyncio.to_thread(doc_path.read_text, "utf-8")
     _save_history(session, doc_path, current_content)
 
     if command == "str_replace":
@@ -166,7 +167,7 @@ async def handle_edit_doc_file(
             return json.dumps({"error": f"old_str appears {occurrences} times in {filename}. Make it unique."})
 
         new_content = current_content.replace(old_str, new_str, 1)
-        doc_path.write_text(new_content, encoding="utf-8")
+        await asyncio.to_thread(doc_path.write_text, new_content, "utf-8")
 
         # Snippet around the edit
         replacement_line = current_content.split(old_str)[0].count("\n")
@@ -186,7 +187,7 @@ async def handle_edit_doc_file(
         new_str_lines = new_str.split("\n")
         lines = lines[:insert_line] + new_str_lines + lines[insert_line:]
         new_content = "\n".join(lines)
-        doc_path.write_text(new_content, encoding="utf-8")
+        await asyncio.to_thread(doc_path.write_text, new_content, "utf-8")
 
         start = max(0, insert_line - 4)
         end = min(len(lines), start + len(new_str_lines) + 8)

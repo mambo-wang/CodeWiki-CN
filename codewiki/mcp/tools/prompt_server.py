@@ -19,7 +19,6 @@ from codewiki.src.be.prompt_template import (
     format_system_prompt,
     format_leaf_system_prompt,
     format_cluster_prompt,
-    format_user_prompt,
 )
 
 

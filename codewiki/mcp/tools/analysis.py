@@ -52,7 +52,7 @@ def _detect_changes(
         return None
 
     # Try git-based detection first
-    changes = _detect_via_git(repo_path, metadata)
+    changes = _detect_via_git(repo_path, metadata, output_dir)
 
     # Fallback to mtime-based detection
     if changes is None:
@@ -90,6 +90,7 @@ def _detect_changes(
 def _detect_via_git(
     repo_path: Path,
     metadata: Dict[str, Any],
+    output_dir: Path | None = None,
 ) -> Optional[Dict[str, Any]]:
     """Detect changes via git. Returns None if not in a git repo or if no
     previous commit is recorded (so the caller can fall through to mtime).
@@ -146,6 +147,16 @@ def _detect_via_git(
             pass
 
     # 2) Uncommitted changes: staged (index vs HEAD) + unstaged (working tree vs index) + untracked
+    # Compute output_dir relative prefix so we can skip generated docs
+    output_dir_rel = ""
+    if output_dir is not None:
+        try:
+            output_dir_rel = Path(output_dir).resolve().relative_to(repo_root).as_posix()
+            if output_dir_rel == ".":
+                output_dir_rel = ""
+        except (ValueError, TypeError):
+            pass
+
     try:
         for d in list(repo.index.diff("HEAD")) + list(repo.index.diff(None)):
             p = d.a_path
@@ -163,6 +174,11 @@ def _detect_via_git(
                     p = p[len(subpath) + 1:]
                 else:
                     continue
+            # Skip generated docs and session workspace files
+            if p.startswith(".codewiki/"):
+                continue
+            if output_dir_rel and (p == output_dir_rel or p.startswith(output_dir_rel + "/")):
+                continue
             if p not in changed:
                 changed.append(p)
     except Exception:
