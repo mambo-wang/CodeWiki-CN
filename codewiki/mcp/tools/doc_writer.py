@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any, Dict
 
 from codewiki.mcp.session import SessionState, SessionStore
+from codewiki.mcp.tools.file_param import read_param
+from codewiki.mcp.tools.file_param import read_param
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,135 @@ def _safe_doc_path(session: SessionState, filename: str) -> Path | None:
     if not _is_within(doc_path, output_base):
         return None
     return doc_path
+
+
+def _build_okf_frontmatter(
+    session: SessionState,
+    filename: str,
+    content: str,
+) -> str | None:
+    """Build OKF-compliant YAML frontmatter from session metadata.
+
+    Returns the frontmatter string (including --- delimiters) or None if
+    the content already has frontmatter.
+    """
+    # Skip if content already has frontmatter
+    if content.startswith("---"):
+        return None
+
+    mod_name = filename.replace(".md", "").replace("_", " ").title()
+    repo_name = Path(session.repo_path).name if session.repo_path else "unknown"
+
+    # Determine type based on filename
+    if filename.lower() in ("overview.md", "overview"):
+        doc_type = "Architecture"
+    elif filename.lower() in ("index.md", "index"):
+        doc_type = "Index"
+    elif filename.lower() in ("log.md", "log"):
+        doc_type = "Log"
+    else:
+        doc_type = "Module"
+
+    # Extract description from first paragraph of content
+    description = ""
+    lines = content.strip().split("\n")
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            continue
+        if line.startswith("```"):
+            continue
+        if line.startswith("---"):
+            continue
+        description = line[:200]
+        break
+
+    # Get source files from module tree
+    source_files: list[str] = []
+    module_tree = session.module_tree or {}
+    target_mod = filename.replace(".md", "").lower().replace(" ", "_")
+
+    def _find_sources(tree: dict, target: str) -> list[str]:
+        for name, info in tree.items():
+            if name.lower().replace(" ", "_") == target:
+                components = info.get("components", [])
+                files = set()
+                for comp_id in components:
+                    if "::" in comp_id:
+                        files.add(comp_id.split("::")[0])
+                return sorted(files)[:5]  # Limit to 5 source files
+            children = info.get("children", {})
+            if isinstance(children, dict):
+                found = _find_sources(children, target)
+                if found:
+                    return found
+        return []
+
+    source_files = _find_sources(module_tree, target_mod)
+
+    # Build resource URI
+    if source_files:
+        resource = f"file://{source_files[0]}"
+        if len(source_files) > 1:
+            resource += f" (+{len(source_files) - 1} more)"
+    else:
+        resource = f"repo://{repo_name}"
+
+    # Build tags from module name and schema
+    tags = [repo_name]
+    if doc_type == "Module":
+        tags.append(target_mod)
+
+    # Try to read additional tags from schema.yaml
+    try:
+        from codewiki.src.config import SCHEMA_FILENAME
+        schema_path = Path(session.output_dir) / SCHEMA_FILENAME
+        if schema_path.exists():
+            import yaml
+            schema = yaml.safe_load(schema_path.read_text(encoding="utf-8"))
+            if schema and schema.get("conventions", {}).get("okf_tags"):
+                tags.extend(schema["conventions"]["okf_tags"])
+    except Exception:
+        pass
+
+    # Build frontmatter
+    fm_lines = [
+        "---",
+        f"type: {doc_type}",
+        f"title: {mod_name}",
+        f'description: "{description}"' if description else f"description: {mod_name}",
+        f"resource: {resource}",
+        f"tags: [{', '.join(tags)}]",
+        "---",
+        "",
+    ]
+    return "\n".join(fm_lines)
+
+
+def _inject_frontmatter(
+    session: SessionState,
+    filename: str,
+    content: str,
+) -> str:
+    """Prepend OKF frontmatter to content if not already present and enabled in schema."""
+    # Check schema.yaml for okf_frontmatter flag (default True)
+    try:
+        from codewiki.src.config import SCHEMA_FILENAME
+        schema_path = Path(session.output_dir) / SCHEMA_FILENAME
+        if schema_path.exists():
+            import yaml
+            schema = yaml.safe_load(schema_path.read_text(encoding="utf-8"))
+            if schema and not schema.get("conventions", {}).get("okf_frontmatter", True):
+                return content
+    except Exception:
+        pass
+
+    frontmatter = _build_okf_frontmatter(session, filename, content)
+    if frontmatter:
+        return frontmatter + content
+    return content
 
 
 def _ensure_parent_dirs(path: Path) -> None:
@@ -206,7 +337,9 @@ async def handle_write_doc_file(
     if doc_path is None:
         return json.dumps({"error": "Filename escapes output directory."})
 
-    content = arguments["content"]
+    content = read_param(arguments, "content")
+    if content is None:
+        return json.dumps({"error": "content or content_file is required."}, ensure_ascii=False)
 
     _ensure_parent_dirs(doc_path)
 
@@ -215,7 +348,11 @@ async def handle_write_doc_file(
             "error": f"File already exists: {filename}. Use edit_doc_file to modify it."
         })
 
+    # OKF: inject YAML frontmatter from session metadata
+    content = _inject_frontmatter(session, filename, content)
+
     doc_path.write_text(content, encoding="utf-8")
+    session.docs_written += 1
 
     # Mermaid validation
     mermaid_result = await _validate_mermaid(str(doc_path), filename)
@@ -251,10 +388,10 @@ async def handle_write_doc_file(
     except Exception as e:
         logger.warning("Index/log update failed (non-fatal): %s", e)
 
-    # Update BM25 search index
+    # Update BM25 search index (SQLite-backed when session available)
     try:
         from codewiki.mcp.tools.wiki_search import update_file
-        update_file(session.output_dir, doc_path)
+        update_file(session.output_dir, doc_path, session=session)
     except Exception as e:
         logger.warning("Search index update failed (non-fatal): %s", e)
 
@@ -301,10 +438,10 @@ async def handle_edit_doc_file(
         except Exception:
             pass
 
-        # Update BM25 search index after undo
+        # Update BM25 search index after undo (SQLite-backed when session available)
         try:
             from codewiki.mcp.tools.wiki_search import update_file
-            update_file(session.output_dir, doc_path)
+            update_file(session.output_dir, doc_path, session=session)
         except Exception:
             pass
 
@@ -317,13 +454,11 @@ async def handle_edit_doc_file(
     if not doc_path.exists():
         return json.dumps({"error": f"File not found: {filename}. Use write_doc_file to create it."})
 
-    # Save current content to history before editing
     current_content = doc_path.read_text(encoding="utf-8")
-    _save_history(session, doc_path, current_content)
 
     if command == "str_replace":
-        old_str = arguments.get("old_str")
-        new_str = arguments.get("new_str", "")
+        old_str = read_param(arguments, "old_str")
+        new_str = read_param(arguments, "new_str") or ""
         if old_str is None:
             return json.dumps({"error": "old_str is required for str_replace."})
 
@@ -334,6 +469,9 @@ async def handle_edit_doc_file(
             return json.dumps({"error": f"old_str appears {occurrences} times in {filename}. Make it unique."})
 
         new_content = current_content.replace(old_str, new_str, 1)
+        # Save history only for edits that actually happen, so undo never
+        # pops a no-op entry left behind by a failed/rejected command.
+        _save_history(session, doc_path, current_content)
         doc_path.write_text(new_content, encoding="utf-8")
 
         # Snippet around the edit
@@ -345,7 +483,7 @@ async def handle_edit_doc_file(
 
     elif command == "insert":
         insert_line = arguments.get("insert_line", 0)
-        new_str = arguments.get("new_str", "")
+        new_str = read_param(arguments, "new_str") or ""
         if not new_str:
             return json.dumps({"error": "new_str is required for insert."})
 
@@ -354,6 +492,7 @@ async def handle_edit_doc_file(
         new_str_lines = new_str.split("\n")
         lines = lines[:insert_line] + new_str_lines + lines[insert_line:]
         new_content = "\n".join(lines)
+        _save_history(session, doc_path, current_content)
         doc_path.write_text(new_content, encoding="utf-8")
 
         start = max(0, insert_line - 4)
@@ -362,6 +501,8 @@ async def handle_edit_doc_file(
 
     else:
         return json.dumps({"error": f"Unknown command: {command}. Use str_replace, insert, or undo."})
+
+    session.docs_written += 1
 
     # Mermaid validation
     mermaid_result = await _validate_mermaid(str(doc_path), filename)
@@ -393,10 +534,10 @@ async def handle_edit_doc_file(
     except Exception as e:
         logger.warning("Index/log update failed (non-fatal): %s", e)
 
-    # Update BM25 search index
+    # Update BM25 search index (SQLite-backed when session available)
     try:
         from codewiki.mcp.tools.wiki_search import update_file
-        update_file(session.output_dir, doc_path)
+        update_file(session.output_dir, doc_path, session=session)
     except Exception as e:
         logger.warning("Search index update failed (non-fatal): %s", e)
 

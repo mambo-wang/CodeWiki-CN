@@ -8,10 +8,14 @@ methodology without needing its own copy of the prompts.
 
 from __future__ import annotations
 
-import json
-from typing import Any, Dict
+import json, logging
+from pathlib import Path
+from typing import Any, Dict, Optional
 
-from codewiki.mcp.session import SessionStore
+from codewiki.mcp.session import SessionStore, SessionState
+from codewiki.mcp.tools.workspace_result import write_result, _FILE_THRESHOLD
+
+logger = logging.getLogger(__name__)
 from codewiki.src.be.prompt_template import (
     USER_PROMPT,
     REPO_OVERVIEW_PROMPT,
@@ -21,6 +25,89 @@ from codewiki.src.be.prompt_template import (
     format_cluster_prompt,
     format_user_prompt,
 )
+
+
+def _build_schema_constraints(session: Optional[SessionState]) -> str:
+    """Read schema.yaml from session output_dir and build constraint text for prompts.
+
+    Extracts required_sections, documentation_dimensions, and line limits
+    from schema.yaml to inject into documentation generation prompts.
+    Returns empty string if schema is unavailable or unreadable.
+    """
+    if not session or not session.output_dir:
+        return ""
+    schema_path = Path(session.output_dir) / "schema.yaml"
+    if not schema_path.exists():
+        return ""
+    try:
+        import yaml
+        schema = yaml.safe_load(schema_path.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    if not isinstance(schema, dict):
+        return ""
+
+    parts = []
+
+    # Required sections
+    required = schema.get("required_sections", [])
+    if required:
+        lines = []
+        for section in required:
+            if isinstance(section, dict):
+                title = section.get("title", "")
+                mermaid = section.get("mermaid_diagram", False)
+                lines.append(f"  - {title}" + (" (must include Mermaid diagram)" if mermaid else ""))
+            elif isinstance(section, str):
+                lines.append(f"  - {section}")
+        if lines:
+            parts.append("Required sections in every module doc:\n" + "\n".join(lines))
+
+    # Documentation dimensions
+    dims = schema.get("documentation_dimensions", [])
+    if dims:
+        dim_str = ", ".join(str(d).replace("_", " ") for d in dims)
+        parts.append(f"Cover these documentation dimensions: {dim_str}")
+
+    # Line constraints
+    conventions = schema.get("conventions", {})
+    min_lines = conventions.get("min_leaf_doc_lines")
+    max_lines = conventions.get("max_overview_doc_lines")
+    if min_lines or max_lines:
+        c = []
+        if min_lines:
+            c.append(f"min {min_lines} lines for leaf module docs")
+        if max_lines:
+            c.append(f"max {max_lines} lines for overview docs")
+        parts.append(f"Documentation length guidance: {', '.join(c)}")
+
+    # OKF frontmatter
+    if conventions.get("okf_frontmatter", False):
+        parts.append(
+            "OKF (Open Knowledge Format) compliance:\n"
+            "Every markdown file MUST start with YAML frontmatter between `---` delimiters.\n"
+            "Required field:\n"
+            "  - type: one of [Module, Architecture, Index, Log] (required)\n"
+            "Recommended fields:\n"
+            "  - title: concise document title\n"
+            "  - description: 1-2 sentence semantic summary of the module's purpose and responsibilities\n"
+            "  - resource: primary source file path or directory (e.g., src/auth/)\n"
+            "  - tags: list of meaningful semantic tags based on functionality (e.g., [authentication, jwt, session-management])\n"
+            "Example:\n"
+            "```yaml\n"
+            "---\n"
+            "type: Module\n"
+            "title: Authentication Service\n"
+            "description: Handles user authentication, JWT token generation, and session management\n"
+            "resource: src/auth/\n"
+            "tags: [authentication, jwt, session, security]\n"
+            "---\n"
+            "```"
+        )
+
+    if not parts:
+        return ""
+    return "\n\n".join(parts)
 
 
 # Prompt catalog: maps prompt_type to (raw_template, usage_hint, variables_doc)
@@ -102,9 +189,16 @@ def handle_get_prompt(
     arguments: Dict[str, Any],
     store: SessionStore,
 ) -> str:
-    """Return a prompt template, optionally with variables filled in."""
+    """Return a prompt template, optionally with variables filled in.
+
+    When variables are provided and the filled content exceeds 4KB, the
+    prompt is written to a workspace file and only the file path is
+    returned through MCP stdio.
+    """
     prompt_type = arguments["prompt_type"]
     variables = arguments.get("variables", {})
+    session_id = arguments.get("session_id")
+    session = store.get(session_id) if session_id else None
 
     if prompt_type not in _PROMPT_CATALOG:
         available = list(_PROMPT_CATALOG.keys())
@@ -115,6 +209,16 @@ def handle_get_prompt(
 
     catalog_entry = _PROMPT_CATALOG[prompt_type]
 
+    # Inject schema constraints from schema.yaml into variables for _resolve_prompt
+    schema_constraints = _build_schema_constraints(session)
+    variables['_has_caller_ci'] = "custom_instructions" in variables and variables["custom_instructions"]
+    if schema_constraints:
+        caller_ci = variables.get("custom_instructions")
+        if caller_ci:
+            variables["custom_instructions"] = caller_ci + "\n\n" + schema_constraints
+        else:
+            variables["custom_instructions"] = schema_constraints
+
     # Resolve the prompt content
     content = _resolve_prompt(prompt_type, variables)
 
@@ -124,6 +228,22 @@ def handle_get_prompt(
         "usage_hint": catalog_entry["usage_hint"],
         "content": content,
     }
+
+    # Write to file when content is large and session is available
+    if (session and getattr(session, "workspace", None)
+            and len(content.encode("utf-8")) > _FILE_THRESHOLD):
+        file_path = session.workspace.write_text(
+            f"prompt_{prompt_type}.txt", content
+        )
+        return json.dumps({
+            "prompt_type": prompt_type,
+            "description": catalog_entry["description"],
+            "usage_hint": catalog_entry["usage_hint"],
+            "file": str(file_path),
+            "content_length": len(content),
+            "hint": "Read the file for the full prompt content.",
+        }, indent=2, ensure_ascii=False)
+
     return json.dumps(result, indent=2, ensure_ascii=False)
 
 
@@ -143,11 +263,41 @@ def _resolve_prompt(prompt_type: str, variables: Dict[str, Any]) -> str:
     elif prompt_type == "system_complex":
         module_name = variables.get("module_name", "MODULE_NAME")
         custom_instructions = variables.get("custom_instructions", None)
+        doc_type = variables.get("doc_type", "design")
+        if not variables.get("_has_caller_ci") and doc_type:
+            _doc_type_hints = {
+                'api': "Focus on API documentation: endpoints, parameters, return types, and usage examples.",
+                'architecture': "Focus on architecture documentation: system design, component relationships, and data flow.",
+                'user-guide': "Focus on user guide documentation: how to use features, step-by-step tutorials.",
+                'developer': "Focus on developer documentation: code structure, contribution guidelines, and implementation details.",
+                'business': "Focus on business logic documentation: describe business workflows, processing pipelines, state transitions, and domain rules. Emphasize WHAT the system does for users and WHY, trace end-to-end business scenarios through the code, and document domain-specific terminology. De-emphasize infrastructure and deployment details.",
+                'design': "Generate technical design documentation optimized for AI comprehension. For each module, describe in depth: (1) module responsibilities and boundaries, (2) detailed implementation logic and business rules, (3) data flow within and through the module, (4) interface contracts — inputs, outputs, and side effects, (5) internal layered design and component collaboration patterns, (6) relationships and dependencies with other modules, (7) constraints, assumptions, and edge cases. Use precise technical language. Include Mermaid diagrams for complex flows and interactions. Do not limit documentation length — let the content depth match the module's complexity.",
+            }
+            doc_type_hint = _doc_type_hints.get(doc_type.lower(), f"Focus on generating {doc_type} documentation.")
+            if custom_instructions:
+                custom_instructions = doc_type_hint + "\n\n" + custom_instructions
+            else:
+                custom_instructions = doc_type_hint
         return format_system_prompt(module_name, custom_instructions)
 
     elif prompt_type == "system_leaf":
         module_name = variables.get("module_name", "MODULE_NAME")
         custom_instructions = variables.get("custom_instructions", None)
+        doc_type = variables.get("doc_type", "design")
+        if not variables.get("_has_caller_ci") and doc_type:
+            _doc_type_hints = {
+                'api': "Focus on API documentation: endpoints, parameters, return types, and usage examples.",
+                'architecture': "Focus on architecture documentation: system design, component relationships, and data flow.",
+                'user-guide': "Focus on user guide documentation: how to use features, step-by-step tutorials.",
+                'developer': "Focus on developer documentation: code structure, contribution guidelines, and implementation details.",
+                'business': "Focus on business logic documentation: describe business workflows, processing pipelines, state transitions, and domain rules. Emphasize WHAT the system does for users and WHY, trace end-to-end business scenarios through the code, and document domain-specific terminology. De-emphasize infrastructure and deployment details.",
+                'design': "Generate technical design documentation optimized for AI comprehension. For each module, describe in depth: (1) module responsibilities and boundaries, (2) detailed implementation logic and business rules, (3) data flow within and through the module, (4) interface contracts — inputs, outputs, and side effects, (5) internal layered design and component collaboration patterns, (6) relationships and dependencies with other modules, (7) constraints, assumptions, and edge cases. Use precise technical language. Include Mermaid diagrams for complex flows and interactions. Do not limit documentation length — let the content depth match the module's complexity.",
+            }
+            doc_type_hint = _doc_type_hints.get(doc_type.lower(), f"Focus on generating {doc_type} documentation.")
+            if custom_instructions:
+                custom_instructions = doc_type_hint + "\n\n" + custom_instructions
+            else:
+                custom_instructions = doc_type_hint
         return format_leaf_system_prompt(module_name, custom_instructions)
 
     elif prompt_type == "user":
@@ -167,17 +317,51 @@ def _resolve_prompt(prompt_type: str, variables: Dict[str, Any]) -> str:
     elif prompt_type == "overview_module":
         module_name = variables.get("module_name", "MODULE_NAME")
         repo_structure = variables.get("repo_structure", "<REPO_STRUCTURE placeholder>")
+        custom_instructions = variables.get("custom_instructions", None)
+        doc_type = variables.get("doc_type", "design")
+        if not variables.get("_has_caller_ci") and doc_type:
+            _overview_hints = {
+                'architecture': "Focus on system-level architecture: show how modules relate, data flows between components, and the overall layered design. Include a high-level Mermaid architecture diagram.",
+                'design': "Focus on system-level architecture: show how modules relate to each other, data flows between components, overall layered design, and key architectural decisions. Provide a high-level view that helps readers understand the system's structural blueprint. Include Mermaid diagrams for the architecture overview.",
+            }
+            doc_type_hint = _overview_hints.get(doc_type.lower())
+            if doc_type_hint:
+                if custom_instructions:
+                    custom_instructions = doc_type_hint + "\n\n" + custom_instructions
+                else:
+                    custom_instructions = doc_type_hint
+        custom_section = ""
+        if custom_instructions:
+            custom_section = f"\n<CUSTOM_INSTRUCTIONS>\n{custom_instructions}\n</CUSTOM_INSTRUCTIONS>"
         return MODULE_OVERVIEW_PROMPT.format(
             module_name=module_name,
             repo_structure=repo_structure if isinstance(repo_structure, str) else json.dumps(repo_structure, indent=4),
+            custom_instructions=custom_section,
         )
 
     elif prompt_type == "overview_repo":
         repo_name = variables.get("repo_name", "REPO_NAME")
         repo_structure = variables.get("repo_structure", "<REPO_STRUCTURE placeholder>")
+        custom_instructions = variables.get("custom_instructions", None)
+        doc_type = variables.get("doc_type", "design")
+        if not variables.get("_has_caller_ci") and doc_type:
+            _overview_hints = {
+                'architecture': "Focus on system-level architecture: show how modules relate, data flows between components, and the overall layered design. Include a high-level Mermaid architecture diagram.",
+                'design': "Focus on system-level architecture: show how modules relate to each other, data flows between components, overall layered design, and key architectural decisions. Provide a high-level view that helps readers understand the system's structural blueprint. Include Mermaid diagrams for the architecture overview.",
+            }
+            doc_type_hint = _overview_hints.get(doc_type.lower())
+            if doc_type_hint:
+                if custom_instructions:
+                    custom_instructions = doc_type_hint + "\n\n" + custom_instructions
+                else:
+                    custom_instructions = doc_type_hint
+        custom_section = ""
+        if custom_instructions:
+            custom_section = f"\n<CUSTOM_INSTRUCTIONS>\n{custom_instructions}\n</CUSTOM_INSTRUCTIONS>"
         return REPO_OVERVIEW_PROMPT.format(
             repo_name=repo_name,
             repo_structure=repo_structure if isinstance(repo_structure, str) else json.dumps(repo_structure, indent=4),
+            custom_instructions=custom_section,
         )
 
     # --- LLM Wiki static prompts ---
@@ -206,7 +390,7 @@ def _resolve_prompt(prompt_type: str, variables: Dict[str, Any]) -> str:
             "   - **Impact**: Which modules/components are affected?\n"
             "3. Call `ingest_note` with `note_type: 'decision'` (or 'lesson', 'architecture', 'bug_fix').\n"
             "4. If `related_modules` is omitted, the system auto-matches from content.\n"
-            "5. Notes are stored in `repowiki/notes/` and indexed in `decisions_index.json`.\n\n"
+            "5. Notes are stored in `repowiki/notes/` and indexed in `.meta/decisions_index.json`.\n\n"
             "**Tip**: Keep notes concise (200-500 words). Focus on the 'why', not the 'what'."
         )
 

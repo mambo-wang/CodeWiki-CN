@@ -85,8 +85,8 @@ def _fine_grained_tools() -> list[Tool]:
                 "This is the entry point for the wiki generation pipeline. "
                 "After calling this, use get_prompt('cluster') to learn clustering rules, "
                 "then save_module_tree to persist your grouping. "
-                "INCREMENTAL UPDATE: If docs already exist in output_dir (metadata.json + "
-                "module_tree.json), the response includes a 'changes' field showing which "
+                "INCREMENTAL UPDATE: If docs already exist in output_dir (.meta/metadata.json + "
+                ".meta/module_tree.json), the response includes a 'changes' field showing which "
                 "files changed and which modules need updating."
             ),
             inputSchema={
@@ -157,8 +157,12 @@ def _fine_grained_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Markdown content to write",
                     },
+                    "content_file": {
+                        "type": "string",
+                        "description": "Alternative to content: absolute path to a text file. Use for large docs (>200 lines).",
+                    },
                 },
-                "required": ["session_id", "filename", "content"],
+                "required": ["session_id", "filename"],
             },
         ),
         Tool(
@@ -192,6 +196,14 @@ def _fine_grained_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Replacement string (for str_replace/insert)",
                     },
+                    "old_str_file": {
+                        "type": "string",
+                        "description": "Alternative to old_str: absolute path to a text file.",
+                    },
+                    "new_str_file": {
+                        "type": "string",
+                        "description": "Alternative to new_str: absolute path to a text file.",
+                    },
                     "insert_line": {
                         "type": "integer",
                         "description": "Line number for insert (0-indexed)",
@@ -222,8 +234,12 @@ def _fine_grained_tools() -> list[Tool]:
                             "{'components': [component_ids], 'children': {nested modules}}"
                         ),
                     },
+                    "module_tree_file": {
+                        "type": "string",
+                        "description": "Alternative to module_tree: absolute path to a JSON file. Use for large trees (>50 components).",
+                    },
                 },
-                "required": ["session_id", "module_tree"],
+                "required": ["session_id"],
             },
         ),
         Tool(
@@ -249,7 +265,9 @@ def _fine_grained_tools() -> list[Tool]:
                 "Retrieve CodeWiki's prompt templates for each pipeline stage. "
                 "Available types: cluster, system_complex, system_leaf, user, "
                 "overview_module, overview_repo. Optionally pass variables to "
-                "fill in template placeholders."
+                "fill in template placeholders. When variables produce content "
+                ">4KB and a session_id is provided, the prompt is written to "
+                "a workspace file."
             ),
             inputSchema={
                 "type": "object",
@@ -273,6 +291,10 @@ def _fine_grained_tools() -> list[Tool]:
                         "type": "object",
                         "description": "Optional template variables to fill in",
                     },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Optional session ID for writing large prompts to workspace files",
+                    },
                 },
                 "required": ["prompt_type"],
             },
@@ -295,9 +317,11 @@ def _fine_grained_tools() -> list[Tool]:
         Tool(
             name="list_dependencies",
             description=(
-                "List dependency relationships between components or modules. "
-                "Exposes the depends_on / depended_by data from the dependency graph. "
-                "Supports component-level and module-level aggregation for crosslinking."
+                "Write the full dependency graph to a workspace file. "
+                "Returns a compact summary with the file path, total counts, "
+                "and high-impact components. "
+                "Exposes depends_on / depended_by data from the dependency graph. "
+                "Supports component-level and module-level aggregation."
             ),
             inputSchema={
                 "type": "object",
@@ -318,15 +342,7 @@ def _fine_grained_tools() -> list[Tool]:
                     },
                     "module_level": {
                         "type": "boolean",
-                        "description": "Aggregate to module-level dependency graph (default: false)",
-                    },
-                    "offset": {
-                        "type": "integer",
-                        "description": "Pagination offset (default: 0)",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Page size, max 200 (default: 100)",
+                        "description": "Include module-level dependency graph (default: false)",
                     },
                 },
                 "required": ["session_id"],
@@ -371,7 +387,7 @@ def _fine_grained_tools() -> list[Tool]:
             description=(
                 "File a structured note (decision, lesson learned, architecture rationale) "
                 "into the knowledge base. Notes are stored in repowiki/notes/ with "
-                "YAML frontmatter and indexed in decisions_index.json."
+                "YAML frontmatter and indexed in .meta/decisions_index.json."
             ),
             inputSchema={
                 "type": "object",
@@ -462,6 +478,90 @@ def _fine_grained_tools() -> list[Tool]:
                 "required": ["query"],
             },
         ),
+        Tool(
+            name="analyze_workspace",
+            description=(
+                "Scan a parent directory for git repositories and analyze each one "
+                "independently. Each sub-repo gets its own repowiki at <repo>/repowiki/. "
+                "A lightweight overview.md is generated at the workspace level with "
+                "service descriptions, cross-service relationships, and links to each "
+                "sub-repo's wiki. Design principle: one .git = one repowiki. "
+                "Use this for multi-repo workspaces where multiple projects are cloned "
+                "into a single folder. A lightweight workspace session is created for "
+                "cross-service ingest_note / query_wiki at the parent level."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "workspace_path": {
+                        "type": "string",
+                        "description": "Absolute path to the parent directory containing git repos",
+                    },
+                    "output_dir": {
+                        "type": "string",
+                        "description": "Output directory for workspace overview (default: <workspace>/workspace-wiki)",
+                    },
+                    "exclude_dirs": {
+                        "type": "string",
+                        "description": "Comma-separated directory names to skip (default: node_modules,.venv,__pycache__)",
+                    },
+                },
+                "required": ["workspace_path"],
+            },
+        ),
+        Tool(
+            name="list_components",
+            description=(
+                "Write the full component index to a workspace file. "
+                "Returns a compact summary with the file path. "
+                "Use this after analyze_repo to discover components for "
+                "clustering or source reading. Supports filtering by "
+                "file_prefix and component_type."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Session ID from analyze_repo",
+                    },
+                    "file_prefix": {
+                        "type": "string",
+                        "description": "Only return components whose file starts with this prefix",
+                    },
+                    "component_type": {
+                        "type": "string",
+                        "description": "Filter by type: class, function, interface, etc.",
+                    },
+                },
+                "required": ["session_id"],
+            },
+        ),
+        Tool(
+            name="view_repo_file",
+            description=(
+                "Read a file or list a directory within the analyzed repository. "
+                "Use this to read already-generated .md docs (for parent module "
+                "synthesis) or browse source files for extra context. "
+                "All paths are relative to repo_path with traversal protection. "
+                "Directories return a listing; files return content. "
+                "Large files (>50KB) are written to the session workspace."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Session ID from analyze_repo",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path from repo root (e.g. 'repowiki/overview.md' or 'backend/src/...')",
+                    },
+                },
+                "required": ["session_id", "path"],
+            },
+        ),
     ]
 
 
@@ -489,7 +589,7 @@ def _legacy_tools() -> list[Tool]:
                     },
                     "doc_type": {
                         "type": "string",
-                        "enum": ["api", "architecture", "user-guide", "developer"],
+                        "enum": ["api", "architecture", "user-guide", "developer", "business", "design"],
                         "description": "Type of documentation to generate",
                     },
                     "include_patterns": {
@@ -550,6 +650,11 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             # acceptable for this one-time heavy operation).
             return [_text(handle_analyze_repo(arguments, _store))]
 
+        elif name == "analyze_workspace":
+            from codewiki.mcp.tools.workspace_analyzer import handle_analyze_workspace
+            # Runs on main thread because it calls analyze_repo internally
+            return [_text(handle_analyze_workspace(arguments, _store))]
+
         elif name == "read_code_components":
             from codewiki.mcp.tools.code_reader import handle_read_code_components
             return [_text(await asyncio.to_thread(handle_read_code_components, arguments, _store))]
@@ -580,7 +685,16 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             sid = arguments["session_id"]
             session = _store.get(sid)
             if session:
-                _write_generation_metadata(session)
+                # Only stamp the incremental-update baseline when this
+                # session actually produced docs — otherwise an aborted
+                # session would make the next analyze_repo report
+                # "Documentation is up to date" over missing/stale docs.
+                if session.docs_written > 0:
+                    _write_generation_metadata(session)
+                else:
+                    logger.info(
+                        "Session %s wrote no docs; skipping metadata.json baseline update", sid
+                    )
                 # LLM Wiki: update index.md, log.md, and search index before cleanup
                 try:
                     from codewiki.mcp.tools.wiki_index import rebuild_index, append_log
@@ -589,10 +703,10 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                     rebuild_index(session.output_dir)
                 except Exception:
                     pass
-                # Build final BM25 search index
+                # Build final BM25 search index (SQLite-backed when session available)
                 try:
                     from codewiki.mcp.tools.wiki_search import build_full_index
-                    build_full_index(session.output_dir)
+                    build_full_index(session.output_dir, session=session)
                 except Exception:
                     pass
                 # Clean up workspace files on disk
@@ -620,6 +734,14 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         elif name == "query_wiki":
             from codewiki.mcp.tools.knowledge_loop import handle_query_wiki
             return [_text(await asyncio.to_thread(handle_query_wiki, arguments, _store))]
+
+        elif name == "list_components":
+            from codewiki.mcp.tools.component_list import handle_list_components
+            return [_text(await asyncio.to_thread(handle_list_components, arguments, _store))]
+
+        elif name == "view_repo_file":
+            from codewiki.mcp.tools.file_viewer import handle_view_repo_file
+            return [_text(await asyncio.to_thread(handle_view_repo_file, arguments, _store))]
 
         # --- Legacy tools (require CodeWiki LLM config) ---
         elif name == "generate_docs":
@@ -693,8 +815,9 @@ async def _legacy_generate_docs(arguments: dict[str, Any]) -> list[TextContent]:
         agent_instructions=agent_instructions or None,
     )
 
+    from codewiki.cli.utils.repo_validator import get_git_commit_hash
     from codewiki.src.be.documentation_generator import DocumentationGenerator
-    doc_gen = DocumentationGenerator(backend_config)
+    doc_gen = DocumentationGenerator(backend_config, commit_id=get_git_commit_hash(repo_path) or None)
     await doc_gen.run()
 
     generated_files = []
@@ -716,7 +839,8 @@ async def _legacy_get_module_tree(arguments: dict[str, Any]) -> list[TextContent
     repo_path = Path(arguments["repo_path"]).expanduser().resolve()
     output_dir = Path(arguments.get("output_dir", "docs")).expanduser().resolve()
 
-    module_tree_path = output_dir / "module_tree.json"
+    from codewiki.src.config import meta_resolve
+    module_tree_path = Path(meta_resolve(output_dir, "module_tree.json"))
     if not module_tree_path.exists():
         return [_text(json.dumps({
             "error": f"Module tree not found at {module_tree_path}. Run 'codewiki generate' first."
@@ -765,13 +889,13 @@ def _write_generation_metadata(session: SessionState) -> None:
         output_dir = Path(session.output_dir)
         repo_path = Path(session.repo_path)
 
-        commit_id: str | None = None
-        try:
-            import git
-            repo = git.Repo(repo_path, search_parent_directories=True)
-            commit_id = repo.head.commit.hexsha
-        except Exception:
-            pass
+        # Baseline on the commit analyze_repo saw, NOT the current HEAD:
+        # commits made mid-session were never analyzed, and recording HEAD
+        # here would silently exclude them from the next incremental run.
+        commit_id: str | None = session.analyzed_commit
+        if not commit_id:
+            from codewiki.cli.utils.repo_validator import get_git_commit_hash
+            commit_id = get_git_commit_hash(repo_path) or None
 
         from datetime import datetime
         metadata = {
@@ -780,7 +904,10 @@ def _write_generation_metadata(session: SessionState) -> None:
                 "timestamp": datetime.now().isoformat(),
             },
         }
-        (output_dir / "metadata.json").write_text(
+        from codewiki.src.config import meta_join
+        meta_dir = Path(meta_join(output_dir, ""))
+        meta_dir.mkdir(parents=True, exist_ok=True)
+        Path(meta_join(output_dir, "metadata.json")).write_text(
             json.dumps(metadata, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )

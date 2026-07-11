@@ -120,9 +120,9 @@ _CAMEL_RE = re.compile(r"\b([A-Z][a-z]+(?:[A-Z][a-z]*)*)\b")
 
 def _load_symbol_map(output_dir: Path) -> Dict[str, List[str]]:
     """Load symbol_map.json from output_dir.  Returns {} on failure."""
-    from codewiki.src.config import SYMBOL_MAP_FILENAME
+    from codewiki.src.config import SYMBOL_MAP_FILENAME, meta_resolve
 
-    sm_path = output_dir / SYMBOL_MAP_FILENAME
+    sm_path = Path(meta_resolve(output_dir, SYMBOL_MAP_FILENAME))
     if not sm_path.exists():
         return {}
     try:
@@ -270,8 +270,11 @@ def handle_ingest_note(
 
     note_path.write_text(note_content, encoding="utf-8")
 
-    # Update decisions_index.json
-    index_path = output_dir / DECISIONS_INDEX_FILENAME
+    # Update decisions_index.json (stored in .meta/ subdirectory)
+    from codewiki.src.config import META_DIR
+    meta_dir = output_dir / META_DIR
+    meta_dir.mkdir(parents=True, exist_ok=True)
+    index_path = meta_dir / DECISIONS_INDEX_FILENAME
     index_data: Dict[str, Any] = {"entries": []}
     if index_path.exists():
         try:
@@ -315,10 +318,10 @@ def handle_ingest_note(
     except Exception as e:
         logger.warning("Index/log update failed (non-fatal): %s", e)
 
-    # Update BM25 search index for the new note
+    # Update BM25 search index for the new note (SQLite-backed when session available)
     try:
         from codewiki.mcp.tools.wiki_search import update_file
-        update_file(output_dir, note_path)
+        update_file(output_dir, note_path, session=session)
     except Exception as e:
         logger.warning("Search index update failed (non-fatal): %s", e)
 
@@ -439,7 +442,8 @@ def handle_query_wiki(
     if session and session.module_tree:
         module_tree = session.module_tree
     else:
-        mt_path = output_dir / "module_tree.json"
+        from codewiki.src.config import meta_resolve
+        mt_path = Path(meta_resolve(output_dir, "module_tree.json"))
         if mt_path.exists():
             try:
                 module_tree = json.loads(mt_path.read_text(encoding="utf-8"))
@@ -456,11 +460,10 @@ def handle_query_wiki(
         )
         from codewiki.src.config import SEARCH_INDEX_FILENAME
 
-        # Auto-build index if it doesn't exist yet
+        # Auto-build index if it doesn't exist yet (SQLite-backed when session available)
         idx_path = output_dir / SEARCH_INDEX_FILENAME
-        if not idx_path.exists():
-            logger.info("Search index not found, building: %s", idx_path)
-            build_full_index(output_dir)
+        if not idx_path.exists() or session is not None:
+            build_full_index(output_dir, session=session)
 
         raw_results = bm25_search(
             output_dir,
@@ -469,6 +472,7 @@ def handle_query_wiki(
             include_notes=include_notes,
             max_results=max_results,
             expand_terms=expand_terms,
+            session=session,
         )
 
         for r in raw_results:
